@@ -54,7 +54,7 @@ const (
 	// SQL query to retrieve a test result by job_id (includes new fields).
 	getResultSQL = `
 		SELECT
-			job_id, status, project, logs, messages, duration_seconds, started_at, ended_at,
+			job_id, project, status, logs, messages, duration_seconds, started_at, ended_at,
 			screenshots, videos, metadata
 		FROM test_results
 		WHERE job_id = $1;
@@ -352,19 +352,23 @@ func (s *Store) GetJobs(ctx context.Context) ([]models.TestJob, error) {
 	for rows.Next() {
 		var job models.TestJob
 		var detailsJSON []byte
-		var startedAt, endedAt, enqueuedAt sql.NullTime
+		var startedAt, endedAt sql.NullTime
 		var priority sql.NullInt32
 
 		err := rows.Scan(
-			&job.ID, &job.Project, &job.Status, &detailsJSON, &priority, &enqueuedAt, &startedAt, &endedAt,
+			&job.ID, &job.Project, &job.Status, &detailsJSON, &priority, &job.EnqueuedAt, &startedAt, &endedAt,
 		)
+
 		if err != nil {
 			s.logger.Error("Failed to scan active job row", slog.String("error", err.Error()))
 			continue
 		}
-
+		enqueuedAtToStore := job.EnqueuedAt
+		if enqueuedAtToStore.IsZero() {
+			enqueuedAtToStore = time.Now().UTC()
+		}
 		job.Priority = uint8(priority.Int32)
-		job.EnqueuedAt = enqueuedAt.Time
+		job.EnqueuedAt = enqueuedAtToStore
 		job.StartedAt = startedAt.Time
 		job.EndedAt = endedAt.Time
 		if detailsJSON != nil && string(detailsJSON) != "null" {
