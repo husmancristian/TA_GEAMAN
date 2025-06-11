@@ -31,8 +31,9 @@ func SetupRouter(api *API, cfg *config.Config) http.Handler {
 	r.Use(corsMiddleware.Handler) // Apply CORS middleware FIRST or early
 	r.Use(middleware.RequestID)   // Assign unique request IDs
 	r.Use(middleware.RealIP)      // Get real client IP
-	r.Use(middleware.Logger)      // Log API requests (Chi's default logger)
-	r.Use(middleware.Recoverer)   // Recover from panics
+	// Replace chi's default logger with our custom structured logger
+	r.Use(StructuredRequestLogger(api.Logger)) // Use the logger from the API struct
+	r.Use(middleware.Recoverer)                // Recover from panics
 	// Set a reasonable timeout for all requests using config
 	r.Use(middleware.Timeout(cfg.RequestTimeout))
 

@@ -214,6 +214,10 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 		return fmt.Errorf("invalid job data for creating pending job")
 	}
 
+	var logs, messages sql.NullString
+	var duration sql.NullFloat64
+	var startedAt, endedAt sql.NullTime
+
 	detailsJSON, err := json.Marshal(job.Details)
 	if err != nil {
 		if job.Details == nil {
@@ -222,7 +226,10 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 			return fmt.Errorf("failed to marshal job details: %w", err)
 		}
 	}
-
+	enqueuedAtToStore := job.EnqueuedAt
+	if enqueuedAtToStore.IsZero() {
+		enqueuedAtToStore = time.Now().UTC()
+	}
 	// Use UPSERT: Insert PENDING state, or update if somehow exists (shouldn't happen often)
 	_, err = s.db.Exec(ctx, upsertResultSQL,
 		job.ID,
@@ -230,12 +237,12 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 		models.StatusPending, // Explicitly set PENDING
 		detailsJSON,          // details
 		job.Priority,         // priority
-		job.EnqueuedAt,       // enqueued_at
-		sql.NullString{},     // logs
-		[]string(nil),        // messages (nil slice -> NULL array)
-		sql.NullFloat64{},    // duration_seconds
-		sql.NullTime{},       // started_at
-		sql.NullTime{},       // ended_at
+		enqueuedAtToStore,    // enqueued at
+		&logs,                // Scan into sql.NullString
+		&messages,            // Scan into sql.NullString
+		&duration,            // Scan into sql.NullFloat64
+		&startedAt,           // Scan into sql.NullTime
+		&endedAt,             // Scan into sql.NullTime
 		[]string(nil),        // screenshots (nil slice -> NULL array)
 		[]string(nil),        // videos (nil slice -> NULL array)
 		[]byte("null"),       // metadata (JSON null)
@@ -270,8 +277,8 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 
 	_, err = s.db.Exec(ctx, upsertResultSQL,
 		result.JobID,
-		result.Status,
 		projectName, // Project needed for potential INSERT
+		result.Status,
 		nil,
 		nil, // priority - let COALESCE handle it
 		nil, // enqueued_at - let COALESCE handle it
@@ -295,12 +302,32 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 func (s *Store) GetResult(ctx context.Context, jobID string) (*models.TestResult, error) {
 	result := &models.TestResult{JobID: jobID}
 
+	var logs sql.NullString
+	var duration sql.NullFloat64
+	var startedAt, endedAt sql.NullTime
+	// Assuming result.Messages, result.Screenshots, result.Videos are []string
+	// and result.Metadata is json.RawMessage or []byte, which pgx handles for NULL arrays/JSON.
+
 	err := s.db.QueryRow(ctx, getResultSQL, jobID).Scan(
 		&result.JobID, &result.Project, &result.Status,
-		&result.Logs, &result.Messages, &result.Duration,
-		&result.StartedAt, &result.EndedAt,
+		&logs, // Scan into sql.NullString
+		&result.Messages,
+		&duration,  // Scan into sql.NullFloat64
+		&startedAt, // Scan into sql.NullTime
+		&endedAt,   // Scan into sql.NullTime
 		&result.Screenshots, &result.Videos, &result.Metadata,
 	)
+
+	if logs.Valid {
+		result.Logs = logs.String
+	}
+	if duration.Valid {
+		result.Duration = duration.Float64
+	}
+
+	result.StartedAt = startedAt.Time // If NullTime.Valid is false, Time is zero value, which is fine
+	result.EndedAt = endedAt.Time     // If NullTime.Valid is false, Time is zero value, which is fine
+
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -366,12 +393,26 @@ func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]mode
 	results := []models.TestResult{}
 	for rows.Next() {
 		var result models.TestResult
-
+		var duration sql.NullFloat64
+		var startedAt, endedAt sql.NullTime
 		// Ensure the Scan call matches the columns selected in getProjectResultsSQL
 		err := rows.Scan(
-			&result.JobID, &result.Project, &result.Status, &result.Messages, &result.Duration,
-			&result.StartedAt, &result.EndedAt, &result.Metadata, // Assuming Metadata is the last selected field for this simplified query
+			&result.JobID,
+			&result.Project,
+			&result.Status,
+			&result.Messages, // pgx handles []string for TEXT[]
+			&duration,        // Scan into sql.NullFloat64
+			&startedAt,       // Scan into sql.NullTime
+			&endedAt,         // Scan into sql.NullTime
+			&result.Metadata, // pgx handles json.RawMessage for JSONB
 		)
+
+		// Assign values from sql.Null* types
+		if duration.Valid {
+			result.Duration = duration.Float64
+		}
+		result.StartedAt = startedAt.Time // If NullTime.Valid is false, Time is zero value
+		result.EndedAt = endedAt.Time     // If NullTime.Valid is false, Time is zero value
 
 		if err != nil {
 			s.logger.Error("Failed to scan project result row", slog.String("project", project), slog.String("error", err.Error()))
