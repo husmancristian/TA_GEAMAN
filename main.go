@@ -16,9 +16,25 @@ import (
 	"github.com/husmancristian/TA_GEAMAN/pkg/config"             // Use config package
 	"github.com/husmancristian/TA_GEAMAN/pkg/queue/rabbitmq"     // Use RabbitMQ queue
 	"github.com/husmancristian/TA_GEAMAN/pkg/storage/persistent" // Use Persistent store
+	"github.com/joho/godotenv"                                   // Import godotenv
 )
 
 func main() {
+
+	// --- Logger Setup ---
+	logLevel := slog.LevelInfo // Default
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	slog.SetDefault(logger) // Set as default logger for convenience
+
+	// --- Load .env file ---
+	// Load .env file before loading configuration.
+	// This is useful for local development. In production, environment variables are usually set directly.
+	if err := godotenv.Load(); err != nil {
+		logger.Info("No .env file found or error loading .env file, relying on environment variables", slog.String("error", err.Error()))
+	} else {
+		logger.Info("Loaded .env file")
+	}
+
 	// --- Configuration Loading ---
 	cfg, err := config.Load()
 	if err != nil {
@@ -26,8 +42,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- Logger Setup ---
-	logLevel := slog.LevelInfo // Default
 	switch cfg.LogLevel {
 	case "debug":
 		logLevel = slog.LevelDebug
@@ -36,8 +50,6 @@ func main() {
 	case "error":
 		logLevel = slog.LevelError
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger) // Set as default logger for convenience
 
 	logger.Info("Starting Test Automation Server...", slog.String("log_level", cfg.LogLevel))
 	logger.Info("Configured Projects", slog.Any("projects", cfg.Projects)) // Log configured projects
