@@ -30,6 +30,9 @@ type ResultStore interface {
 	// UpdateJobStatus updates the status and potentially other fields (like started_at) for a job.
 	UpdateJobStatus(ctx context.Context, jobID string, status string) error
 
+	// CountJobsByStatus counts the number of jobs for a given project and status.
+	CountJobsByStatus(ctx context.Context, project string, status string) (int, error)
+
 	// Close releases any resources held by the store (e.g., DB connections).
 	Close() error
 }

@@ -361,7 +361,16 @@ func (a *API) HandleGetAllQueueStatuses(w http.ResponseWriter, r *http.Request) 
 			}
 			continue
 		}
-		overview = append(overview, map[string]interface{}{"project": project, "pending_jobs": size})
+		runningCount, err := a.ResultStore.CountJobsByStatus(r.Context(), project, models.StatusRunning)
+		if err != nil {
+			logger.Error("Failed to get running job count for overview", slog.String("project", project), slog.String("error", err.Error()))
+			if firstError == nil {
+				firstError = fmt.Errorf("project %s (running count): %w", project, err)
+			}
+			runningCount = 0 // Default to 0 if there's an error, the overall request might still fail if firstError is set
+		}
+		overview = append(overview, map[string]interface{}{"project": project, "pending_jobs": size, "running_suites": runningCount})
+
 	}
 
 	if firstError != nil {

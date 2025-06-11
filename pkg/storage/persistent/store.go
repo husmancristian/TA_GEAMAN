@@ -87,6 +87,12 @@ const (
 		WHERE project = $1
 		ORDER BY COALESCE(started_at, ended_at) DESC; -- Show most recent first
 	`
+	// SQL query to count jobs by project and status.
+	countJobsByStatusSQL = `
+		SELECT COUNT(*)
+		FROM test_results
+		WHERE project = $1 AND status = $2;
+	`
 
 	// SQL for creating the table (Updated for reference)
 	/*
@@ -474,4 +480,17 @@ func (s *Store) UpdateJobStatus(ctx context.Context, jobID string, status string
 	}
 	s.logger.Info("Updated job status in storage", slog.String("job_id", jobID), slog.String("new_status", status))
 	return nil
+}
+
+// CountJobsByStatus counts the number of jobs for a given project and status.
+func (s *Store) CountJobsByStatus(ctx context.Context, project string, status string) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, countJobsByStatusSQL, project, status).Scan(&count)
+	if err != nil {
+		// pgx.ErrNoRows is not expected for COUNT(*), it should return 0 rows with 0 value if no match.
+		// Any error here is likely a connection issue or syntax error.
+		s.logger.Error("Failed to count jobs by status", slog.String("project", project), slog.String("status", status), slog.String("error", err.Error()))
+		return 0, fmt.Errorf("failed to count jobs for project %s with status %s: %w", project, status, err)
+	}
+	return count, nil
 }
