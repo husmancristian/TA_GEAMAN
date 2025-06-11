@@ -54,8 +54,7 @@ const (
 	// SQL query to retrieve a test result by job_id (includes new fields).
 	getResultSQL = `
 		SELECT
-			job_id, project, status, details, priority, enqueued_at,
-			logs, messages, duration_seconds, started_at, ended_at,
+			job_id, status, project, logs, messages, duration_seconds, started_at, ended_at,
 			screenshots, videos, metadata
 		FROM test_results
 		WHERE job_id = $1;
@@ -77,6 +76,16 @@ const (
 		WHERE status IN ($1, $2, $3) -- Filter by active statuses
 		ORDER BY enqueued_at ASC -- Example: oldest pending first
 		LIMIT 200; -- Example limit
+	`
+	// SQL query to retrieve all test results for a specific project.
+	getProjectResultsSQL = `
+		SELECT
+			job_id, project, status, 
+			messages, duration_seconds, started_at, ended_at,
+			metadata
+		FROM test_results
+		WHERE project = $1
+		ORDER BY COALESCE(started_at, ended_at) DESC; -- Show most recent first
 	`
 
 	// SQL for creating the table (Updated for reference)
@@ -140,19 +149,51 @@ func NewStore(pgDSN, minioEndpoint, minioAccessKey, minioSecretKey, bucketName s
 	logger.Info("MinIO client initialized", slog.String("endpoint", minioEndpoint))
 
 	// --- Ensure MinIO Bucket Exists ---
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
+	// Use a separate context for bucket operations for clarity, though the parent context could be used.
+	bucketCtx, bucketCancel := context.WithTimeout(context.Background(), 30*time.Second) // Increased timeout slightly for bucket + policy
+	defer bucketCancel()
+
+	exists, err := minioClient.BucketExists(bucketCtx, bucketName)
 	if err != nil {
-		exists, errBucketExists := minioClient.BucketExists(ctx, bucketName)
-		if errBucketExists == nil && exists {
-			logger.Info("MinIO bucket already exists", slog.String("bucket", bucketName))
-		} else {
-			dbpool.Close()
-			return nil, fmt.Errorf("failed to make/verify MinIO bucket '%s': %w", bucketName, err)
+		dbpool.Close() // Close DB pool before returning
+		return nil, fmt.Errorf("failed to check if MinIO bucket '%s' exists: %w", bucketName, err)
+	}
+	if !exists {
+		err = minioClient.MakeBucket(bucketCtx, bucketName, minio.MakeBucketOptions{})
+		if err != nil {
+			dbpool.Close() // Close DB pool before returning
+			return nil, fmt.Errorf("failed to make MinIO bucket '%s': %w", bucketName, err)
 		}
-	} else {
 		logger.Info("Successfully created MinIO bucket", slog.String("bucket", bucketName))
+	} else {
+		logger.Info("MinIO bucket already exists", slog.String("bucket", bucketName))
+	}
+
+	// --- Set Public Read Policy for the Bucket ---
+	// This policy makes all objects in the bucket publicly readable via GET requests.
+	policy := fmt.Sprintf(`{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Principal": {"AWS":["*"]},
+				"Action": ["s3:GetObject"],
+				"Resource": ["arn:aws:s3:::%s/*"]
+			}
+		]
+	}`, bucketName)
+
+	err = minioClient.SetBucketPolicy(bucketCtx, bucketName, policy)
+	if err != nil {
+		// Log a warning. Depending on your deployment, you might want to treat this as a fatal error.
+		// If the policy is already set or managed externally, this error might be benign.
+		logger.Warn("Failed to set public read policy on MinIO bucket. Artifacts may not be accessible via public URLs.",
+			slog.String("bucket", bucketName), slog.String("error", err.Error()))
+		// Example: To make it fatal:
+		// dbpool.Close()
+		// return nil, fmt.Errorf("failed to set public read policy on MinIO bucket '%s': %w", bucketName, err)
+	} else {
+		logger.Info("Successfully set public read policy on MinIO bucket", slog.String("bucket", bucketName))
 	}
 
 	return &Store{db: dbpool, minioClient: minioClient, bucketName: bucketName, logger: logger}, nil
@@ -188,17 +229,17 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 		job.Project,
 		models.StatusPending, // Explicitly set PENDING
 		detailsJSON,          // details
-		sql.NullInt32{Int32: int32(job.Priority), Valid: true},              // priority
-		sql.NullTime{Time: job.EnqueuedAt, Valid: !job.EnqueuedAt.IsZero()}, // enqueued_at
-		// Nullable fields for results (set explicitly to NULL or default)
-		sql.NullString{},  // logs
-		[]string(nil),     // messages (nil slice -> NULL array)
-		sql.NullFloat64{}, // duration_seconds
-		sql.NullTime{},    // started_at
-		sql.NullTime{},    // ended_at
-		[]string(nil),     // screenshots (nil slice -> NULL array)
-		[]string(nil),     // videos (nil slice -> NULL array)
-		[]byte("null"),    // metadata (JSON null)
+		nil,                  // details - let COALESCE handle it from existing or EXCLUDED if it were part of TestResult
+		nil,                  // priority - let COALESCE handle it
+		nil,                  // enqueued_at - let COALESCE handle it
+		sql.NullString{},     // logs
+		[]string(nil),        // messages (nil slice -> NULL array)
+		sql.NullFloat64{},    // duration_seconds
+		sql.NullTime{},       // started_at
+		sql.NullTime{},       // ended_at
+		[]string(nil),        // screenshots (nil slice -> NULL array)
+		[]string(nil),        // videos (nil slice -> NULL array)
+		[]byte("null"),       // metadata (JSON null)
 	)
 	if err != nil {
 		return fmt.Errorf("failed to execute upsert for pending job %s: %w", job.ID, err)
@@ -209,6 +250,7 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 
 // SaveResult UPSERTS the result metadata to PostgreSQL. Handles both initial save and updates.
 func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error {
+
 	metadataJSON, err := json.Marshal(result.Metadata)
 	if err != nil {
 		if result.Metadata == nil {
@@ -229,11 +271,11 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 
 	_, err = s.db.Exec(ctx, upsertResultSQL,
 		result.JobID,
-		projectName, // Project needed for potential INSERT
 		result.Status,
-		[]byte("null"),  // details (not typically updated here, set on create)
-		sql.NullInt32{}, // priority (not typically updated here)
-		sql.NullTime{},  // enqueued_at (not typically updated here)
+		projectName, // Project needed for potential INSERT
+		nil,
+		nil, // priority - let COALESCE handle it
+		nil, // enqueued_at - let COALESCE handle it
 		sql.NullString{String: result.Logs, Valid: result.Logs != ""},
 		result.Messages, // Pass slice directly, pgx handles nil/empty mapping to NULL/{}
 		sql.NullFloat64{Float64: result.Duration, Valid: result.Duration > 0},
@@ -253,47 +295,18 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 // GetResult retrieves result metadata from PostgreSQL including new fields.
 func (s *Store) GetResult(ctx context.Context, jobID string) (*models.TestResult, error) {
 	result := &models.TestResult{JobID: jobID}
-	var detailsJSON, metadataJSON []byte
-	var logs sql.NullString
-	var duration sql.NullFloat64
-	var startedAt, endedAt, enqueuedAt sql.NullTime
-	var priority sql.NullInt32
-	var project sql.NullString
 
 	err := s.db.QueryRow(ctx, getResultSQL, jobID).Scan(
-		&result.JobID, &project, &result.Status, &detailsJSON, &priority, &enqueuedAt,
-		&logs, &result.Messages, &duration, &startedAt, &endedAt,
-		&result.Screenshots, &result.Videos, &metadataJSON,
+		&result.JobID, &result.Project, &result.Status,
+		&result.Logs, &result.Messages, &result.Duration,
+		&result.StartedAt, &result.EndedAt,
+		&result.Screenshots, &result.Videos, &result.Metadata,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query result for job %s: %w", jobID, err)
-	}
-
-	result.Project = project.String
-	result.Logs = logs.String
-	result.Duration = duration.Float64
-	result.StartedAt = startedAt.Time
-	result.EndedAt = endedAt.Time
-
-	var tempDetails map[string]interface{}
-	if detailsJSON != nil && string(detailsJSON) != "null" {
-		if err := json.Unmarshal(detailsJSON, &tempDetails); err != nil {
-			s.logger.Warn("Failed to unmarshal details JSON from DB", slog.String("job_id", jobID), slog.String("error", err.Error()))
-		}
-	}
-	result.Metadata = tempDetails // Assume details stored in metadata for now
-
-	if metadataJSON != nil && string(metadataJSON) != "null" {
-		if result.Metadata == nil {
-			if err := json.Unmarshal(metadataJSON, &result.Metadata); err != nil {
-				s.logger.Warn("Failed to unmarshal metadata JSON from DB", slog.String("job_id", jobID), slog.String("error", err.Error()))
-			}
-		} else {
-			s.logger.Info("Metadata field already populated from details, skipping separate metadata unmarshal", slog.String("job_id", jobID))
-		}
 	}
 
 	return result, nil
@@ -340,6 +353,44 @@ func (s *Store) GetJobs(ctx context.Context) ([]models.TestJob, error) {
 		return nil, fmt.Errorf("error iterating active job rows: %w", err)
 	}
 	return jobs, nil
+}
+
+// GetResultsByProject retrieves all test results for a given project.
+func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]models.TestResult, error) {
+	rows, err := s.db.Query(ctx, getProjectResultsSQL, project)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to query results for project %s: %w", project, err)
+	}
+	defer rows.Close()
+
+	results := []models.TestResult{}
+	for rows.Next() {
+		var result models.TestResult
+
+		// Ensure the Scan call matches the columns selected in getProjectResultsSQL
+		err := rows.Scan(
+			&result.JobID, &result.Project, &result.Status, &result.Messages, &result.Duration,
+			&result.StartedAt, &result.EndedAt, &result.Metadata, // Assuming Metadata is the last selected field for this simplified query
+		)
+		// The log call was helpful for debugging, you can keep or remove it.
+		// s.logger.Info("LOG", slog.String("job id ", result.JobID), slog.String("project ", result.Project), slog.String("status ", result.Status),
+		// 	slog.Float64("duration ", result.Duration), slog.String("started at ", result.StartedAt.String()),
+		// 	slog.String("ended at ", result.EndedAt.String()),
+		// )
+		if err != nil {
+			s.logger.Error("Failed to scan project result row", slog.String("project", project), slog.String("error", err.Error()))
+			continue // Skip this row and try to process others
+		}
+
+		results = append(results, result)
+
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating project result rows for project %s: %w", project, err)
+	}
+	return results, nil
+
 }
 
 // StoreArtifact uploads data to the configured MinIO bucket.

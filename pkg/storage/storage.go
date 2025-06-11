@@ -24,6 +24,9 @@ type ResultStore interface {
 	// GetJobs retrieves a list of ACTIVE jobs (Pending, Running, etc.).
 	GetJobs(ctx context.Context) ([]models.TestJob, error)
 
+	// GetResultsByProject retrieves all test results for a given project.
+	GetResultsByProject(ctx context.Context, project string) ([]models.TestResult, error)
+
 	// UpdateJobStatus updates the status and potentially other fields (like started_at) for a job.
 	UpdateJobStatus(ctx context.Context, jobID string, status string) error
 

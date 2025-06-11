@@ -79,6 +79,12 @@ func SetupRouter(api *API, cfg *config.Config) http.Handler {
 			// Existing endpoint for specific queue
 			r.Get("/{project}/status", api.HandleGetQueueStatus)
 		})
+
+		// Project specific routes
+		r.Route("/projects/{project}", func(r chi.Router) {
+			// Get all results for a specific project
+			r.Get("/results", api.HandleGetProjectResults)
+		})
 	})
 
 	return r

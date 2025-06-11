@@ -27,7 +27,7 @@ type TestJob struct {
 
 // TestResult is the data submitted by the runner after execution
 type TestResult struct {
-	JobID       string                 `json:"-"`                     // Usually taken from URL path, not body
+	JobID       string                 `json:"job_id"`                // Usually taken from URL path, not body
 	Status      string                 `json:"status"`                // Final status: PASSED, FAILED, ERROR, SKIPPED
 	Project     string                 `json:"project"`               // Project title
 	Logs        string                 `json:"logs,omitempty"`        // Captured logs (can be large)

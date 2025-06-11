@@ -50,6 +50,19 @@ func (a *API) HandleEnqueueTest(w http.ResponseWriter, r *http.Request) {
 		httperrors.BadRequest(w, logger, nil, "Missing required field: project")
 		return
 	}
+
+	// Validate if the project exists in the configuration
+	projectIsValid := false
+	for _, p := range a.Config.Projects {
+		if p == req.Project {
+			projectIsValid = true
+			break
+		}
+	}
+	if !projectIsValid {
+		httperrors.BadRequest(w, logger, nil, fmt.Sprintf("Project '%s' is not a configured project", req.Project))
+		return
+	}
 	priority := req.Priority
 	if priority == 0 {
 		priority = defaultPriority
@@ -217,10 +230,13 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var result models.TestResult
+	logger.Info("ajung la result json  ", slog.String("resultJSON", resultJSON))
+
 	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
 		httperrors.BadRequest(w, logger, err, "Invalid JSON in result field")
 		return
 	}
+
 	result.JobID = jobID
 	if result.Status == "" {
 		httperrors.BadRequest(w, logger, nil, "Missing status in result JSON")
@@ -234,12 +250,15 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	screenshotURLs := []string{}
+
 	videoURLs := []string{}
 	if r.MultipartForm != nil && r.MultipartForm.File != nil {
 		for key, fileHeaders := range r.MultipartForm.File {
 			for _, fh := range fileHeaders {
 				logger.Info("Processing uploaded file", slog.String("field", key), slog.String("filename", fh.Filename))
 				artifactURL, err := parseAndStoreFile(r.Context(), a.ResultStore, fh, jobID, logger)
+				logger.Info("artifactURL ", slog.String("artifactURL", artifactURL))
+
 				if err != nil {
 					httperrors.InternalServerError(w, logger, err, "Failed to store artifact")
 					return
@@ -370,6 +389,29 @@ func (a *API) HandleGetJobs(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(jobs); err != nil {
 		logger.Error("Failed to encode jobs response", slog.String("error", err.Error()))
+	}
+}
+
+// HandleGetProjectResults retrieves all results for a specific project.
+func (a *API) HandleGetProjectResults(w http.ResponseWriter, r *http.Request) {
+	project := chi.URLParam(r, "project")
+	logger := a.Logger.With(slog.String("handler", "HandleGetProjectResults"), slog.String("project", project))
+	if project == "" {
+		httperrors.BadRequest(w, logger, nil, "Missing project name")
+		return
+	}
+
+	results, err := a.ResultStore.GetResultsByProject(r.Context(), project)
+	if err != nil {
+		httperrors.InternalServerError(w, logger, err, fmt.Sprintf("Failed to retrieve results for project %s", project))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(results); err != nil {
+		logger.Error("Failed to encode project results response", slog.String("project", project), slog.String("error", err.Error()))
+		// httperrors.InternalServerError is not called here as headers might have been written
 	}
 }
 
