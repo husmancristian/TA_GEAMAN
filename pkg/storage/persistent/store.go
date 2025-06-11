@@ -229,9 +229,8 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 		job.Project,
 		models.StatusPending, // Explicitly set PENDING
 		detailsJSON,          // details
-		nil,                  // details - let COALESCE handle it from existing or EXCLUDED if it were part of TestResult
-		nil,                  // priority - let COALESCE handle it
-		nil,                  // enqueued_at - let COALESCE handle it
+		job.Priority,         // priority
+		job.EnqueuedAt,       // enqueued_at
 		sql.NullString{},     // logs
 		[]string(nil),        // messages (nil slice -> NULL array)
 		sql.NullFloat64{},    // duration_seconds
@@ -373,11 +372,7 @@ func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]mode
 			&result.JobID, &result.Project, &result.Status, &result.Messages, &result.Duration,
 			&result.StartedAt, &result.EndedAt, &result.Metadata, // Assuming Metadata is the last selected field for this simplified query
 		)
-		// The log call was helpful for debugging, you can keep or remove it.
-		// s.logger.Info("LOG", slog.String("job id ", result.JobID), slog.String("project ", result.Project), slog.String("status ", result.Status),
-		// 	slog.Float64("duration ", result.Duration), slog.String("started at ", result.StartedAt.String()),
-		// 	slog.String("ended at ", result.EndedAt.String()),
-		// )
+
 		if err != nil {
 			s.logger.Error("Failed to scan project result row", slog.String("project", project), slog.String("error", err.Error()))
 			continue // Skip this row and try to process others

@@ -86,9 +86,12 @@ func (a *API) HandleEnqueueTest(w http.ResponseWriter, r *http.Request) {
 		Status:     models.StatusPending,
 	}
 	// Use the interface method CreatePendingJob
-	if err := a.ResultStore.CreatePendingJob(r.Context(), pendingJob); err != nil {
+	if errDb := a.ResultStore.CreatePendingJob(r.Context(), pendingJob); errDb != nil {
 		// Log error, but don't fail the request as job is already queued
-		logger.Error("Failed to save initial pending job state to storage", slog.String("job_id", jobID), slog.String("error", err.Error()))
+		logger.Error("Failed to save initial pending job state to storage", slog.String("job_id", jobID), slog.String("error", errDb.Error()))
+		// For now, return an error to the client as the operation was not fully successful.
+		httperrors.InternalServerError(w, logger, errDb, fmt.Sprintf("Failed to save initial state for job %s", jobID))
+		return
 		// Maybe implement compensating action to remove from queue? Complex.
 	}
 
