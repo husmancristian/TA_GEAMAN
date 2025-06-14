@@ -81,10 +81,13 @@ func SetupRouter(api *API, cfg *config.Config) http.Handler {
 			r.Get("/{project}/status", api.HandleGetQueueStatus)
 		})
 
-		// Project specific routes
-		r.Route("/projects/{project}", func(r chi.Router) {
-			// Get all results for a specific project
-			r.Get("/results", api.HandleGetProjectResults)
+		// Project Management & Project-Specific Data
+		r.Route("/projects", func(r chi.Router) {
+			r.Post("/", api.HandleAddProject) // Add a new project
+			r.Route("/{projectName}", func(r chi.Router) {
+				r.Delete("/", api.HandleDeleteProject)         // Delete a project
+				r.Get("/results", api.HandleGetProjectResults) // Get all results for a specific project (uses projectName)
+			})
 		})
 	})
 

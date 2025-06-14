@@ -228,7 +228,7 @@ func (m *RabbitMQManager) declareProjectQueue(project string) error {
 }
 
 // EnqueueJob publishes a new test job message using a temporary channel.
-func (m *RabbitMQManager) EnqueueJob(project string, details map[string]interface{}, priority uint8) (string, error) {
+func (m *RabbitMQManager) EnqueueJob(project string, details map[string]interface{}, userPriority uint8) (string, error) {
 	// Ensure the queue exists for this project (uses its own temp channel)
 	if err := m.declareProjectQueue(project); err != nil {
 		return "", err
@@ -241,12 +241,28 @@ func (m *RabbitMQManager) EnqueueJob(project string, details map[string]interfac
 	}
 	defer ch.Close() // Ensure temporary channel is closed
 
+	// Clamp userPriority to be within 0 and maxPriority
+	// Lower userPriority value means higher importance.
+	effectiveUserPriority := userPriority
+	if effectiveUserPriority > uint8(maxPriority) { // maxPriority is int, cast for comparison
+		m.logger.Warn("User priority exceeds max configured queue priority, clamping to lowest effective user priority.",
+			slog.Uint64("user_priority", uint64(userPriority)),
+			slog.Int("max_queue_priority_levels", maxPriority),
+			slog.Uint64("clamped_user_priority", uint64(maxPriority)))
+		effectiveUserPriority = uint8(maxPriority)
+	}
+
+	// Invert priority for RabbitMQ: lower user number = higher RabbitMQ number
+	// e.g., user_priority 0 (highest) -> rabbitmq_priority maxPriority (e.g., 10)
+	// e.g., user_priority maxPriority (lowest) -> rabbitmq_priority 0
+	rabbitmqMessagePriority := uint8(maxPriority) - effectiveUserPriority
+
 	jobID := uuid.NewString() // Generate unique ID
 	jobMsg := models.JobMessage{
 		ID:         jobID,
 		Project:    project,
 		Details:    details,
-		Priority:   priority,
+		Priority:   userPriority, // Store the original user-facing priority in the message
 		EnqueuedAt: time.Now().UTC(),
 	}
 
@@ -265,8 +281,8 @@ func (m *RabbitMQManager) EnqueueJob(project string, details map[string]interfac
 		false,        // immediate
 		amqp.Publishing{
 			ContentType:  contentTypeJSON,
-			DeliveryMode: amqp.Persistent, // Make message persistent
-			Priority:     priority,        // Set message priority
+			DeliveryMode: amqp.Persistent,         // Make message persistent
+			Priority:     rabbitmqMessagePriority, // Set RabbitMQ message priority
 			Timestamp:    time.Now().UTC(),
 			Body:         body,
 			MessageId:    jobID, // Use job ID as message ID
@@ -278,7 +294,8 @@ func (m *RabbitMQManager) EnqueueJob(project string, details map[string]interfac
 	m.logger.Info("Enqueued job",
 		slog.String("job_id", jobID),
 		slog.String("project", project),
-		slog.Uint64("priority", uint64(priority)),
+		slog.Uint64("user_priority", uint64(userPriority)),
+		slog.Uint64("rabbitmq_priority", uint64(rabbitmqMessagePriority)),
 	)
 	return jobID, nil
 }
@@ -360,7 +377,11 @@ func (m *RabbitMQManager) GetNextJob(project string) (*models.TestJob, queue.Ack
 		Status:     models.StatusRunning, // Assume status becomes Running upon dequeue
 	}
 
-	m.logger.Info("Dequeued job", slog.String("job_id", testJob.ID), slog.String("project", testJob.Project))
+	m.logger.Info("Dequeued job",
+		slog.String("job_id", testJob.ID),
+		slog.String("project", testJob.Project),
+		slog.Uint64("priority", uint64(testJob.Priority)),
+	)
 
 	// Return the job and the AckNacker interface (which holds the channel open)
 	return testJob, ackNacker, nil

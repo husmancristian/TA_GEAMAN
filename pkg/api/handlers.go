@@ -7,8 +7,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
-
-	// Removed sync import as it's no longer needed here
+	"sync" // Added for mutex
 	"time"
 
 	httperrors "github.com/husmancristian/TA_GEAMAN/errors" // Error helpers
@@ -26,15 +25,106 @@ const (
 	defaultPriority     = 5
 )
 
+// API struct now includes a cache for the dynamic project list.
 type API struct {
 	QueueManager queue.Manager
-	ResultStore  storage.ResultStore
+	ResultStore  storage.ResultStore // Will be used to fetch projects from DB
 	Logger       *slog.Logger
-	Config       *config.Config
+	AppConfig    *config.Config // Renamed from Config to avoid confusion
+
+	// For dynamic project list management
+	projectsCache      []string
+	projectsCacheMutex sync.RWMutex
+	cacheRefreshTicker *time.Ticker // For periodic refresh
+	cacheDoneChan      chan bool    // To stop the ticker goroutine
 }
 
+// NewAPI initializes the API, populates the project cache, and starts periodic refresh.
 func NewAPI(qm queue.Manager, rs storage.ResultStore, logger *slog.Logger, cfg *config.Config) *API {
-	return &API{QueueManager: qm, ResultStore: rs, Logger: logger, Config: cfg}
+	api := &API{
+		QueueManager:       qm,
+		ResultStore:        rs,
+		Logger:             logger,
+		AppConfig:          cfg,
+		cacheRefreshTicker: time.NewTicker(5 * time.Minute), // Example: refresh every 5 mins
+		cacheDoneChan:      make(chan bool),
+	}
+
+	// Initial cache population
+	if err := api.refreshProjectsCache(context.Background()); err != nil {
+		logger.Error("Failed to perform initial population of projects cache", slog.String("error", err.Error()))
+		// Consider how to handle this: panic, or run with potentially empty/stale cache.
+		// For now, we log and continue.
+	}
+
+	// Start periodic cache refresh in a separate goroutine
+	go api.runPeriodicCacheRefresh()
+
+	return api
+}
+
+// ShutdownCacheRefresher should be called during graceful application shutdown.
+func (a *API) ShutdownCacheRefresher() {
+	if a.cacheRefreshTicker != nil {
+		a.cacheRefreshTicker.Stop()
+	}
+	if a.cacheDoneChan != nil {
+		// Check if channel is already closed to prevent panic
+		select {
+		case <-a.cacheDoneChan:
+			// Already closed or received signal
+		default:
+			close(a.cacheDoneChan)
+		}
+	}
+	a.Logger.Info("Project cache refresher shut down.")
+}
+
+func (a *API) refreshProjectsCache(ctx context.Context) error {
+	a.Logger.Debug("Attempting to refresh projects cache from storage")
+	projects, err := a.ResultStore.GetProjects(ctx) // Uses new storage method
+	if err != nil {
+		a.Logger.Error("Failed to get projects from storage for cache refresh", slog.String("error", err.Error()))
+		return fmt.Errorf("ResultStore.GetProjects failed: %w", err)
+	}
+
+	a.projectsCacheMutex.Lock()
+	a.projectsCache = projects
+	a.projectsCacheMutex.Unlock()
+	a.Logger.Info("Projects cache refreshed", slog.Int("count", len(projects)), slog.Any("projects", projects))
+	return nil
+}
+
+func (a *API) runPeriodicCacheRefresh() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.Logger.Error("Panic recovered in runPeriodicCacheRefresh", slog.Any("panic", r))
+		}
+	}()
+	for {
+		select {
+		case <-a.cacheDoneChan:
+			a.Logger.Info("Stopping periodic projects cache refresh.")
+			return
+		case <-a.cacheRefreshTicker.C:
+			a.Logger.Debug("Periodic projects cache refresh triggered.")
+			if err := a.refreshProjectsCache(context.Background()); err != nil {
+				// Error is logged within refreshProjectsCache
+			}
+		}
+	}
+}
+
+// isProjectValid checks against the cached projects list.
+func (a *API) isProjectValid(projectName string) bool {
+	a.projectsCacheMutex.RLock()
+	defer a.projectsCacheMutex.RUnlock()
+	for _, p := range a.projectsCache {
+		if p == projectName {
+			return true
+		}
+	}
+	return false
 }
 
 // HandleEnqueueTest now also saves initial PENDING state to storage.
@@ -51,22 +141,20 @@ func (a *API) HandleEnqueueTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate if the project exists in the configuration
-	projectIsValid := false
-	for _, p := range a.Config.Projects {
-		if p == req.Project {
-			projectIsValid = true
-			break
-		}
-	}
-	if !projectIsValid {
+	// Validate if the project exists using the cached list
+	if !a.isProjectValid(req.Project) {
 		httperrors.BadRequest(w, logger, nil, fmt.Sprintf("Project '%s' is not a configured project", req.Project))
 		return
 	}
-	priority := req.Priority
-	if priority == 0 {
-		priority = defaultPriority
-	}
+
+	// Log the priority received from the request body AFTER decoding
+	logger.Info("Priority from decoded request body", slog.Uint64("req.Priority_after_decode", uint64(req.Priority)))
+
+	priority := req.Priority // User-defined priority. If 0, it's intended as highest.
+	// The defaultPriority constant might be used if req.Priority could be nil (e.g. *uint8),
+	// indicating "not set". With uint8, omitted is 0, which now means highest.
+	// Log the priority value that will be passed to EnqueueJob
+	logger.Info("Priority value being passed to EnqueueJob", slog.Uint64("priority_to_enqueue", uint64(priority)))
 
 	// 1. Enqueue the job using the interface method directly
 	jobID, err := a.QueueManager.EnqueueJob(req.Project, req.Details, priority)
@@ -340,7 +428,12 @@ func (a *API) HandleGetQueueStatus(w http.ResponseWriter, r *http.Request) {
 // HandleGetAllQueueStatuses retrieves the pending job count for all configured projects.
 func (a *API) HandleGetAllQueueStatuses(w http.ResponseWriter, r *http.Request) {
 	logger := a.Logger.With(slog.String("handler", "HandleGetAllQueueStatuses"))
-	projects := a.Config.Projects
+
+	a.projectsCacheMutex.RLock()
+	projects := make([]string, len(a.projectsCache))
+	copy(projects, a.projectsCache)
+	a.projectsCacheMutex.RUnlock()
+
 	if len(projects) == 0 {
 		logger.Warn("No projects configured")
 		w.Header().Set("Content-Type", "application/json")
@@ -524,4 +617,82 @@ func isTerminalStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+// --- Project Management Handlers (Modified to use ResultStore and cache) ---
+
+type projectManagementRequest struct {
+	Name string `json:"name"`
+}
+
+// HandleAddProject adds a new project to the database and refreshes the cache.
+func (a *API) HandleAddProject(w http.ResponseWriter, r *http.Request) {
+	logger := a.Logger.With(slog.String("handler", "HandleAddProject"))
+	var req projectManagementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperrors.BadRequest(w, logger, err, "Invalid JSON request body")
+		return
+	}
+	defer r.Body.Close()
+
+	if req.Name == "" {
+		httperrors.BadRequest(w, logger, nil, "Missing required field: name")
+		return
+	}
+
+	// Check if project already exists (optional, DB constraint should handle this too)
+	if a.isProjectValid(req.Name) {
+		httperrors.InternalServerError(w, logger, nil, fmt.Sprintf("Project '%s' already exists or is cached", req.Name))
+		return
+	}
+
+	// Add to database
+	if err := a.ResultStore.AddProject(r.Context(), req.Name); err != nil {
+		// Handle specific DB errors, e.g., unique constraint violation as conflict
+		logger.Error("Failed to add project to database", slog.String("project_name", req.Name), slog.String("error", err.Error()))
+		httperrors.InternalServerError(w, logger, err, "Failed to add project")
+		return
+	}
+
+	// Refresh cache
+	if err := a.refreshProjectsCache(r.Context()); err != nil {
+		logger.Error("Failed to refresh project cache after adding project", slog.String("project_name", req.Name), slog.String("error", err.Error()))
+		// Project was added to DB, but cache refresh failed. Log and inform user.
+		httperrors.InternalServerError(w, logger, err, "Project added, but cache refresh failed. Changes may not be immediately visible.")
+		return
+	}
+
+	logger.Info("Added new project and refreshed cache", slog.String("project_name", req.Name))
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Project added successfully", "project_name": req.Name})
+}
+
+// HandleDeleteProject removes a project from the database and refreshes the cache.
+func (a *API) HandleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	projectName := chi.URLParam(r, "projectName") // Ensure this matches the route param in routes.go
+	logger := a.Logger.With(slog.String("handler", "HandleDeleteProject"), slog.String("project_name", projectName))
+
+	if projectName == "" {
+		httperrors.BadRequest(w, logger, nil, "Missing project name in URL path")
+		return
+	}
+
+	// Delete from database
+	if err := a.ResultStore.DeleteProject(r.Context(), projectName); err != nil {
+		// Handle specific DB errors, e.g., if project not found
+		logger.Error("Failed to delete project from database", slog.String("project_name", projectName), slog.String("error", err.Error()))
+		httperrors.InternalServerError(w, logger, err, "Failed to delete project")
+		return
+	}
+
+	// Refresh cache
+	if err := a.refreshProjectsCache(r.Context()); err != nil {
+		logger.Error("Failed to refresh project cache after deleting project", slog.String("project_name", projectName), slog.String("error", err.Error()))
+		httperrors.InternalServerError(w, logger, err, "Project deleted, but cache refresh failed. Changes may not be immediately visible.")
+		return
+	}
+
+	logger.Info("Deleted project and refreshed cache", slog.String("project_name", projectName))
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Project deleted successfully", "project_name": projectName})
 }

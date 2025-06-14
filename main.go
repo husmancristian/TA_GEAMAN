@@ -52,7 +52,7 @@ func main() {
 	}
 
 	logger.Info("Starting Test Automation Server...", slog.String("log_level", cfg.LogLevel))
-	logger.Info("Configured Projects", slog.Any("projects", cfg.Projects)) // Log configured projects
+	// logger.Info("Configured Projects", slog.Any("projects", cfg.Projects)) // Log configured projects
 
 	// --- Context for graceful shutdown ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

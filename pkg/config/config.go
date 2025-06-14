@@ -2,8 +2,7 @@ package config
 
 import (
 	"os"
-	"strconv"
-	"strings" // Import strings package
+	"strconv" // Import strings package
 	"time"
 )
 
@@ -19,7 +18,7 @@ type Config struct {
 	MinIO_BucketName string
 	LogLevel         string // e.g., "debug", "info", "warn", "error"
 	RequestTimeout   time.Duration
-	Projects         []string // Added: List of known project names/queues
+	// Projects         []string // REMOVED: Projects will be managed via DB and cached in API
 }
 
 // Load loads configuration from environment variables.
@@ -54,24 +53,6 @@ func Load() (*Config, error) {
 		return fallback
 	}
 
-	// Helper to get comma-separated list env var
-	getenvStringSlice := func(key, fallback string) []string {
-		value := getenv(key, fallback)
-		if value == "" {
-			return []string{}
-		}
-		// Trim spaces and filter out empty strings
-		var result []string
-		parts := strings.Split(value, ",")
-		for _, part := range parts {
-			trimmed := strings.TrimSpace(part)
-			if trimmed != "" {
-				result = append(result, trimmed)
-			}
-		}
-		return result
-	}
-
 	cfg := &Config{
 		Port:             getenv("PORT", "8080"),
 		RabbitMQ_URL:     getenv("RABBITMQ_URL", "amqp://localhost:5672/"),                                    // Fallback without credentials
@@ -83,8 +64,7 @@ func Load() (*Config, error) {
 		MinIO_BucketName: getenv("MINIO_BUCKET_NAME", "test-artifacts"),
 		LogLevel:         getenv("LOG_LEVEL", "info"),
 		RequestTimeout:   getenvDuration("REQUEST_TIMEOUT", 15*time.Second),
-		// Load projects from env var (e.g., PROJECTS="WebAppA,WebAppB,MobileAppC")
-		Projects: getenvStringSlice("PROJECTS", "WebAppA,WebAppB,WebAppC,MobileAppA"), // Default example
+		// Projects are no longer loaded from env. They are managed via DB.
 	}
 
 	// Add validation if needed (e.g., check required fields)

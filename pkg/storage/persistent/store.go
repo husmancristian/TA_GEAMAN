@@ -94,6 +94,20 @@ const (
 		WHERE project = $1 AND status = $2;
 	`
 
+	// --- Project Management SQL ---
+	addProjectSQL = `
+		INSERT INTO projects (name) VALUES ($1)
+		ON CONFLICT (name) DO NOTHING;
+	`
+	deleteProjectSQL = `
+		DELETE FROM projects WHERE name = $1;
+	`
+	getProjectsSQL = `
+		SELECT name
+		FROM projects
+		ORDER BY name ASC;
+	`
+
 	// SQL for creating the table (Updated for reference)
 	/*
 		-- Run this manually or via migrations after connecting to the DB:
@@ -121,6 +135,13 @@ const (
 		CREATE INDEX IF NOT EXISTS idx_test_results_created_at ON test_results (created_at);
 		CREATE INDEX IF NOT EXISTS idx_test_results_updated_at ON test_results (updated_at);
 		CREATE INDEX IF NOT EXISTS idx_test_results_enqueued_at ON test_results (enqueued_at);
+
+		-- Table for managing projects dynamically
+		CREATE TABLE IF NOT EXISTS projects (
+			name VARCHAR(255) PRIMARY KEY,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_test_results_enqueued_at ON test_results (enqueued_at);
 	*/
 
 )
@@ -131,6 +152,71 @@ type Store struct {
 	minioClient *minio.Client // MinIO client
 	bucketName  string        // MinIO bucket name
 	logger      *slog.Logger
+}
+
+// AddProject adds a new project name to the projects table.
+// It uses ON CONFLICT DO NOTHING to be idempotent.
+func (s *Store) AddProject(ctx context.Context, projectName string) error {
+	if projectName == "" {
+		return errors.New("project name cannot be empty")
+	}
+	_, err := s.db.Exec(ctx, addProjectSQL, projectName)
+	if err != nil {
+		s.logger.Error("Failed to add project to database", slog.String("project_name", projectName), slog.String("error", err.Error()))
+		return fmt.Errorf("failed to execute add project query for '%s': %w", projectName, err)
+	}
+	s.logger.Info("Attempted to add project to database", slog.String("project_name", projectName))
+	return nil
+}
+
+// DeleteProject removes a project name from the projects table.
+func (s *Store) DeleteProject(ctx context.Context, projectName string) error {
+	if projectName == "" {
+		return errors.New("project name cannot be empty for deletion")
+	}
+	cmdTag, err := s.db.Exec(ctx, deleteProjectSQL, projectName)
+	if err != nil {
+		s.logger.Error("Failed to delete project from database", slog.String("project_name", projectName), slog.String("error", err.Error()))
+		return fmt.Errorf("failed to execute delete project query for '%s': %w", projectName, err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		s.logger.Warn("Attempted to delete a non-existent project or no rows affected", slog.String("project_name", projectName))
+		// Depending on desired behavior, you might return a specific "not found" error here.
+		// For now, no error if not found, as the state (project not existing) is achieved.
+	} else {
+		s.logger.Info("Deleted project from database", slog.String("project_name", projectName))
+	}
+	return nil
+}
+
+// GetProjects retrieves a list of all project names from the projects table.
+func (s *Store) GetProjects(ctx context.Context) ([]string, error) {
+	rows, err := s.db.Query(ctx, getProjectsSQL)
+	if err != nil {
+		s.logger.Error("Failed to query projects from database", slog.String("error", err.Error()))
+		return nil, fmt.Errorf("failed to execute get projects query: %w", err)
+	}
+	defer rows.Close()
+
+	var projects []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			s.logger.Error("Failed to scan project name row", slog.String("error", err.Error()))
+			// Decide if one bad row should fail the whole operation or just be skipped.
+			// For now, let's be strict and return the error.
+			return nil, fmt.Errorf("failed to scan project name: %w", err)
+		}
+		projects = append(projects, name)
+	}
+
+	if err = rows.Err(); err != nil {
+		s.logger.Error("Error iterating project rows", slog.String("error", err.Error()))
+		return nil, fmt.Errorf("error iterating project rows: %w", err)
+	}
+
+	s.logger.Debug("Retrieved projects from database", slog.Int("count", len(projects)))
+	return projects, nil
 }
 
 // NewStore creates a new persistent store instance.

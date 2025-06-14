@@ -33,6 +33,11 @@ type ResultStore interface {
 	// CountJobsByStatus counts the number of jobs for a given project and status.
 	CountJobsByStatus(ctx context.Context, project string, status string) (int, error)
 
+	// --- Project Management ---
+	AddProject(ctx context.Context, projectName string) error
+	DeleteProject(ctx context.Context, projectName string) error
+	GetProjects(ctx context.Context) ([]string, error) // Gets all currently active/configured projects
+
 	// Close releases any resources held by the store (e.g., DB connections).
 	Close() error
 }
