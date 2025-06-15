@@ -61,6 +61,14 @@ type ProjectResultSummary struct {
 	EndedAt  time.Time              `json:"ended_at,omitempty"`         // Use EndedAt for recency sorting
 }
 
+// ProjectQueueOverview represents the status of a single project queue for the overview endpoint.
+type ProjectQueueOverview struct {
+	Project         string `json:"project"`
+	PendingJobs     int    `json:"pending_jobs"`
+	RunningSuites   int    `json:"running_suites"`
+	HighestPriority *uint8 `json:"highest_priority,omitempty"` // Pointer to allow null/omission if no pending jobs
+}
+
 // Constants for Job Status
 const (
 	StatusPending        = "PENDING"

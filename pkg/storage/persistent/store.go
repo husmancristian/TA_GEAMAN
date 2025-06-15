@@ -106,6 +106,16 @@ const (
 		WHERE project = $1 AND status = $2;
 	`
 
+	// SQL query to get pending jobs count, running suites count, and the highest priority (lowest number) among PENDING jobs for a project.
+	getProjectQueueOverviewSQL = `
+		SELECT
+			COALESCE(SUM(CASE WHEN status = $2 THEN 1 ELSE 0 END), 0) AS pending_jobs_count,      -- $2 = 'PENDING'
+			MIN(CASE WHEN status = $2 THEN priority END) AS highest_priority,                   -- Only consider priority for PENDING jobs
+			COALESCE(SUM(CASE WHEN status = $3 THEN 1 ELSE 0 END), 0) AS running_suites_count   -- $3 = 'RUNNING'
+		FROM test_results
+		WHERE project = $1 AND status IN ($2, $3); -- $1 = project_name
+	`
+
 	// --- Project Management SQL ---
 	addProjectSQL = `
 		INSERT INTO projects (name) VALUES ($1)
@@ -705,4 +715,31 @@ func (s *Store) CountJobsByStatus(ctx context.Context, project string, status st
 		return 0, fmt.Errorf("failed to count jobs for project %s with status %s: %w", project, status, err)
 	}
 	return count, nil
+}
+
+// GetProjectQueueOverview retrieves pending job count, running count, and highest priority for a project.
+func (s *Store) GetProjectQueueOverview(ctx context.Context, project string) (*models.ProjectQueueOverview, error) {
+	overview := &models.ProjectQueueOverview{
+		Project: project,
+	}
+	var dbPriority sql.NullInt32 // Use sql.NullInt32 for MIN(priority) which can be NULL
+
+	err := s.db.QueryRow(ctx, getProjectQueueOverviewSQL, project, models.StatusPending, models.StatusRunning).Scan(
+		&overview.PendingJobs,
+		&dbPriority,
+		&overview.RunningSuites,
+	)
+
+	if err != nil {
+		// pgx.ErrNoRows is not expected here as the query uses aggregate functions and should always return a row.
+		s.logger.Error("Failed to get project queue overview", slog.String("project", project), slog.String("error", err.Error()))
+		return nil, fmt.Errorf("failed to get queue overview for project %s: %w", project, err)
+	}
+
+	if dbPriority.Valid {
+		highestPrio := uint8(dbPriority.Int32)
+		overview.HighestPriority = &highestPrio
+	}
+
+	return overview, nil
 }

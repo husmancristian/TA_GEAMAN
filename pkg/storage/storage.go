@@ -36,6 +36,9 @@ type ResultStore interface {
 	// CountJobsByStatus counts the number of jobs for a given project and status.
 	CountJobsByStatus(ctx context.Context, project string, status string) (int, error)
 
+	// GetProjectQueueOverview retrieves pending job count, running count, and highest priority for a project.
+	GetProjectQueueOverview(ctx context.Context, project string) (*models.ProjectQueueOverview, error)
+
 	// --- Project Management ---
 	AddProject(ctx context.Context, projectName string) error
 	DeleteProject(ctx context.Context, projectName string) error

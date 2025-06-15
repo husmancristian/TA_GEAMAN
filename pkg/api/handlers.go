@@ -244,15 +244,21 @@ func (a *API) HandleGetNextTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if currentDBStatus == models.StatusRunning || currentDBStatus == models.StatusAbortRequested {
-		logger.Warn("Job from queue already in RUNNING or ABORT_REQUESTED state in DB. NACKing.", slog.String("db_status", currentDBStatus))
-		if nackErr := ackNacker.Nack(true); nackErr != nil { // Requeue=true, let queue/another worker sort it out
-			logger.Error("Failed to Nack job already running/abort_requested", slog.String("nack_error", nackErr.Error()))
+	if currentDBStatus == models.StatusRunning {
+		logger.Warn("Job from queue already in RUNNING state in DB. NACKing (requeue).", slog.String("db_status", currentDBStatus))
+		if nackErr := ackNacker.Nack(true); nackErr != nil { // Requeue=true
+			logger.Error("Failed to Nack job already running", slog.String("nack_error", nackErr.Error()))
 		}
 		w.WriteHeader(http.StatusNoContent) // Runner should try for another job (simplest for runner)
 		return
+	} else if currentDBStatus == models.StatusAbortRequested {
+		logger.Info("Job from queue already in ABORT_REQUESTED state in DB. ACK'ing and discarding.", slog.String("db_status", currentDBStatus))
+		if ackErr := ackNacker.Ack(); ackErr != nil {
+			logger.Error("Failed to ACK already ABORT_REQUESTED job", slog.String("ack_error", ackErr.Error()))
+		}
+		w.WriteHeader(http.StatusNoContent) // Runner should try for another job
+		return
 	}
-
 	// If status is PENDING (or any other valid non-terminal, non-running state), proceed to update to RUNNING.
 	if currentDBStatus != models.StatusPending {
 		logger.Warn("Job from queue found in DB with unexpected non-terminal/non-running status. Proceeding to set RUNNING.",
@@ -466,28 +472,22 @@ func (a *API) HandleGetAllQueueStatuses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	overview := make([]map[string]interface{}, 0, len(projects))
+	overviewResponse := make([]models.ProjectQueueOverview, 0, len(projects))
 	var firstError error
 
 	for _, project := range projects {
-		size, err := a.QueueManager.GetQueueSize(project)
+		projectOverview, err := a.ResultStore.GetProjectQueueOverview(r.Context(), project)
 		if err != nil {
-			logger.Error("Failed to get queue size for overview", slog.String("project", project), slog.String("error", err.Error()))
+			logger.Error("Failed to get project queue overview", slog.String("project", project), slog.String("error", err.Error()))
 			if firstError == nil {
-				firstError = fmt.Errorf("project %s: %w", project, err)
+				firstError = fmt.Errorf("failed to get overview for project %s: %w", project, err)
 			}
-			continue
+			// Continue to try and fetch for other projects, but report the first error.
+			continue // Skip appending this project if there was an error
 		}
-		runningCount, err := a.ResultStore.CountJobsByStatus(r.Context(), project, models.StatusRunning)
-		if err != nil {
-			logger.Error("Failed to get running job count for overview", slog.String("project", project), slog.String("error", err.Error()))
-			if firstError == nil {
-				firstError = fmt.Errorf("project %s (running count): %w", project, err)
-			}
-			runningCount = 0 // Default to 0 if there's an error, the overall request might still fail if firstError is set
+		if projectOverview != nil {
+			overviewResponse = append(overviewResponse, *projectOverview)
 		}
-		overview = append(overview, map[string]interface{}{"project": project, "pending_jobs": size, "running_suites": runningCount})
-
 	}
 
 	if firstError != nil {
@@ -496,7 +496,7 @@ func (a *API) HandleGetAllQueueStatuses(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(overview); err != nil {
+	if err := json.NewEncoder(w).Encode(overviewResponse); err != nil {
 		logger.Error("Failed to encode queue overview response", slog.String("error", err.Error()))
 	}
 }
@@ -606,6 +606,86 @@ func (a *API) HandleAbortJob(w http.ResponseWriter, r *http.Request) {
 	logger.Info("Job status marked as ABORT_REQUESTED in storage")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Abort request processed for job %s.", jobID)
+}
+
+// HandlePrioritizeJob re-queues an existing PENDING job with the highest priority.
+func (a *API) HandlePrioritizeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "jobId")
+	logger := a.Logger.With(slog.String("handler", "HandlePrioritizeJob"), slog.String("original_job_id", jobID))
+
+	originalResult, err := a.ResultStore.GetResult(r.Context(), jobID)
+	if err != nil {
+		httperrors.InternalServerError(w, logger, err, "Could not retrieve original job details to prioritize")
+		return
+	}
+	if originalResult == nil {
+		httperrors.NotFound(w, logger, nil, fmt.Sprintf("Original job %s not found to prioritize", jobID))
+		return
+	}
+
+	if originalResult.Status != models.StatusPending {
+		httperrors.BadRequest(w, logger, nil, fmt.Sprintf("Job %s is not in PENDING state, cannot prioritize. Current status: %s", jobID, originalResult.Status))
+		return
+	}
+
+	// 1. Mark the original job as cancelled (or superseded)
+	// Using StatusCancelled for simplicity, as HandleGetNextTest already handles it.
+	err = a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusCancelled, map[string]interface{}{"reason": fmt.Sprintf("Superseded by priority request for new job")})
+	if err != nil {
+		httperrors.InternalServerError(w, logger, err, fmt.Sprintf("Failed to update original job %s status before prioritizing", jobID))
+		return
+	}
+	logger.Info("Marked original job as CANCELLED before re-queueing with high priority", slog.String("original_job_id", jobID))
+
+	// 2. Enqueue a new job with original details and highest priority
+	highestPriority := uint8(0) // Assuming 0 is highest
+	newJobID, err := a.QueueManager.EnqueueJob(originalResult.Project, originalResult.Details, highestPriority)
+	if err != nil {
+		// Potentially try to revert the original job's status if this fails? Complex.
+		httperrors.InternalServerError(w, logger, err, "Failed to enqueue new high-priority job")
+		return
+	}
+
+	// 3. Create initial PENDING record for the new high-priority job
+	// This is similar to HandleEnqueueTest
+	pendingJob := &models.TestJob{ID: newJobID, Project: originalResult.Project, Details: originalResult.Details, Priority: highestPriority, EnqueuedAt: time.Now().UTC(), Status: models.StatusPending}
+	if errDb := a.ResultStore.CreatePendingJob(r.Context(), pendingJob); errDb != nil {
+		logger.Error("Failed to save initial pending state for new high-priority job to storage", slog.String("new_job_id", newJobID), slog.String("original_job_id", jobID), slog.String("error", errDb.Error()))
+		// Job is in queue, but DB record failed. Critical to log.
+	}
+
+	logger.Info("Successfully re-queued job with high priority", slog.String("original_job_id", jobID), slog.String("new_job_id", newJobID))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Job prioritized successfully", "original_job_id": jobID, "new_job_id": newJobID})
+}
+
+// HandleGetJobStatusCheck returns the current status of a specific job.
+// This is useful for runners to poll if an abort has been requested.
+func (a *API) HandleGetJobStatusCheck(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "jobId")
+	logger := a.Logger.With(slog.String("handler", "HandleGetJobStatusCheck"), slog.String("job_id", jobID))
+
+	if jobID == "" {
+		httperrors.BadRequest(w, logger, nil, "Missing job ID in URL path")
+		return
+	}
+
+	result, err := a.ResultStore.GetResult(r.Context(), jobID)
+	if err != nil {
+		httperrors.InternalServerError(w, logger, err, "Failed to retrieve job status")
+		return
+	}
+	if result == nil {
+		httperrors.NotFound(w, logger, nil, fmt.Sprintf("Job %s not found", jobID))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]string{"job_id": result.JobID, "status": result.Status}); err != nil {
+		logger.Error("Failed to encode job status response", slog.String("error", err.Error()))
+	}
 }
 
 // HandleUpdateJobProgress handles real-time updates to a job's progress.
@@ -732,6 +812,19 @@ func (a *API) HandleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	if projectName == "" {
 		httperrors.BadRequest(w, logger, nil, "Missing project name in URL path")
 		return
+	}
+
+	// Check for delete protection key if it's configured
+	if a.AppConfig.DeleteProtectionKey != "" {
+		headerKey := r.Header.Get("X-Delete-Key")
+		if headerKey == "" {
+			httperrors.BadRequest(w, logger, nil, "sike")
+			return
+		}
+		if headerKey != a.AppConfig.DeleteProtectionKey {
+			httperrors.BadRequest(w, logger, nil, "no")
+			return
+		}
 	}
 
 	// Delete from database

@@ -65,12 +65,13 @@ func SetupRouter(api *API, cfg *config.Config) http.Handler {
 
 			// Actions on specific jobs
 			r.Route("/{jobId}", func(r chi.Router) {
-				r.Post("/cancel", api.HandleCancelJob)           // Request cancellation of a pending job
-				r.Post("/skip", api.HandleSkipJob)               // Mark a pending job as skipped
-				r.Post("/rerun", api.HandleRerunJob)             // Re-queue a completed/failed job
-				r.Post("/abort", api.HandleAbortJob)             // Request abortion of a running job
-				r.Post("/progress", api.HandleUpdateJobProgress) // Update job progress in real-time
-				// Maybe add: r.Get("/status", api.HandleGetJobStatus) // Get current status without full result
+				r.Post("/cancel", api.HandleCancelJob)              // Request cancellation of a pending job
+				r.Post("/skip", api.HandleSkipJob)                  // Mark a pending job as skipped
+				r.Post("/rerun", api.HandleRerunJob)                // Re-queue a completed/failed job
+				r.Post("/abort", api.HandleAbortJob)                // Request abortion of a running job
+				r.Post("/prioritize", api.HandlePrioritizeJob)      // Re-queue a PENDING job with highest priority
+				r.Get("/status-check", api.HandleGetJobStatusCheck) // Get current status of a job
+				r.Post("/progress", api.HandleUpdateJobProgress)    // Update job progress in real-time
 			})
 		})
 
