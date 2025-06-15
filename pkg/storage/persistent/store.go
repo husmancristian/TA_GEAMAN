@@ -29,10 +29,10 @@ const (
 	upsertResultSQL = `
 		INSERT INTO test_results (
 			job_id, project, status, details, priority, enqueued_at, -- Enqueue fields
-			logs, messages, duration_seconds, started_at, ended_at, -- Result fields
+			logs, messages, duration_seconds, started_at, ended_at, passrate, progress, -- Result fields
 			screenshots, videos, metadata, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW()
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
 		)
 		ON CONFLICT (job_id) DO UPDATE SET
 			project = COALESCE(EXCLUDED.project, test_results.project), -- Keep original if not provided in update
@@ -45,6 +45,8 @@ const (
 			duration_seconds = EXCLUDED.duration_seconds,
 			started_at = EXCLUDED.started_at,
 			ended_at = EXCLUDED.ended_at,
+			passrate = EXCLUDED.passrate,
+			progress = EXCLUDED.progress,
 			screenshots = EXCLUDED.screenshots,
 			videos = EXCLUDED.videos,
 			metadata = EXCLUDED.metadata,
@@ -54,8 +56,8 @@ const (
 	// SQL query to retrieve a test result by job_id (includes new fields).
 	getResultSQL = `
 		SELECT
-			job_id, project, status, logs, messages, duration_seconds, started_at, ended_at,
-			screenshots, videos, metadata
+			job_id, project, status, details, priority, enqueued_at,
+			logs, messages, duration_seconds, started_at, ended_at, passrate, progress, screenshots, videos, metadata
 		FROM test_results
 		WHERE job_id = $1;
 	`
@@ -63,15 +65,27 @@ const (
 	updateStatusAndStartSQL = `
 		UPDATE test_results
 		SET status = $2,
-		    -- Add explicit ::TIMESTAMPTZ cast to parameter $3
 		    started_at = CASE WHEN $3::TIMESTAMPTZ IS NOT NULL THEN $3::TIMESTAMPTZ ELSE started_at END,
+			details = CASE WHEN $4::JSONB IS NOT NULL THEN $4::JSONB ELSE details END,
+			updated_at = NOW()
+		WHERE job_id = $1; -- $2: status, $3: started_at, $4: details
+	`
+	// SQL query to update job progress (status, append logs, merge metadata)
+	updateJobProgressSQL = `
+		UPDATE test_results
+		SET
+			status = CASE WHEN $2::VARCHAR IS NOT NULL THEN $2::VARCHAR ELSE status END, -- $2 is status string (sql.NullString), explicit cast
+			logs = CASE WHEN $3::TEXT IS NOT NULL THEN COALESCE(logs, '') || $3::TEXT ELSE logs END, -- $3 is logs_chunk string (sql.NullString), explicit cast
+			messages = CASE WHEN $4::TEXT[] IS NOT NULL THEN COALESCE(messages, '{}'::TEXT[]) || $4::TEXT[] ELSE messages END, -- $4 is messages_chunk TEXT[], explicit cast
+			passrate = CASE WHEN $5::TEXT IS NOT NULL THEN $5::TEXT ELSE passrate END, -- $5 is passrate string (sql.NullString)
+			progress = CASE WHEN $6::TEXT IS NOT NULL THEN $6::TEXT ELSE progress END, -- $6 is progress string (sql.NullString)
 			updated_at = NOW()
 		WHERE job_id = $1;
 	`
 	// Updated SQL query to retrieve ACTIVE jobs (Pending, Running, AbortRequested)
 	getActiveJobsSQL = `
 		SELECT
-			job_id, project, status, details, priority, enqueued_at, started_at, ended_at
+			job_id, project, status, details, priority, enqueued_at, started_at, ended_at, passrate, progress
 		FROM test_results
 		WHERE status IN ($1, $2, $3) -- Filter by active statuses
 		ORDER BY enqueued_at ASC -- Example: oldest pending first
@@ -80,12 +94,10 @@ const (
 	// SQL query to retrieve all test results for a specific project.
 	getProjectResultsSQL = `
 		SELECT
-			job_id, project, status, 
-			messages, duration_seconds, started_at, ended_at,
-			metadata
+			job_id, project, status, details, ended_at, passrate, progress, duration_seconds
 		FROM test_results
 		WHERE project = $1
-		ORDER BY COALESCE(started_at, ended_at) DESC; -- Show most recent first
+		ORDER BY COALESCE(ended_at, created_at) DESC; -- Show most recent first, fallback to created_at
 	`
 	// SQL query to count jobs by project and status.
 	countJobsByStatusSQL = `
@@ -326,18 +338,20 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 	_, err = s.db.Exec(ctx, upsertResultSQL,
 		job.ID,
 		job.Project,
-		models.StatusPending, // Explicitly set PENDING
-		detailsJSON,          // details
-		job.Priority,         // priority
-		enqueuedAtToStore,    // enqueued at
-		&logs,                // Scan into sql.NullString
-		&messages,            // Scan into sql.NullString
-		&duration,            // Scan into sql.NullFloat64
-		&startedAt,           // Scan into sql.NullTime
-		&endedAt,             // Scan into sql.NullTime
-		[]string(nil),        // screenshots (nil slice -> NULL array)
-		[]string(nil),        // videos (nil slice -> NULL array)
-		[]byte("null"),       // metadata (JSON null)
+		models.StatusPending,         // Explicitly set PENDING
+		detailsJSON,                  // details
+		job.Priority,                 // priority
+		enqueuedAtToStore,            // enqueued at
+		&logs,                        // Scan into sql.NullString
+		&messages,                    // Scan into sql.NullString
+		&duration,                    // Scan into sql.NullFloat64
+		&startedAt,                   // Scan into sql.NullTime
+		&endedAt,                     // Scan into sql.NullTime
+		[]string(nil),                // screenshots (nil slice -> NULL array)
+		[]string(nil),                // videos (nil slice -> NULL array)
+		sql.NullString{Valid: false}, // passrate
+		sql.NullString{Valid: false}, // progress
+		[]byte("null"),               // metadata (JSON null)
 	)
 	if err != nil {
 		return fmt.Errorf("failed to execute upsert for pending job %s: %w", job.ID, err)
@@ -349,14 +363,19 @@ func (s *Store) CreatePendingJob(ctx context.Context, job *models.TestJob) error
 // SaveResult UPSERTS the result metadata to PostgreSQL. Handles both initial save and updates.
 func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error {
 
-	metadataJSON, err := json.Marshal(result.Metadata)
-	if err != nil {
-		if result.Metadata == nil {
-			metadataJSON = []byte("null")
-		} else {
+	var metadataToStore []byte
+	// If compiler sees result.Metadata as map[string]interface{}, we need to marshal it.
+	if result.Metadata != nil && len(result.Metadata) > 0 { // Check if map is not nil and not empty
+		marshaledMetadata, err := json.Marshal(result.Metadata)
+		if err != nil {
+			s.logger.Error("Failed to marshal result metadata", slog.String("job_id", result.JobID), slog.String("error", err.Error()))
 			return fmt.Errorf("failed to marshal result metadata: %w", err)
 		}
+		metadataToStore = marshaledMetadata
+	} else {
+		metadataToStore = []byte("null") // Store JSON null if input is nil, empty, or explicitly "null"
 	}
+
 	if result.JobID == "" {
 		return fmt.Errorf("cannot save result with empty JobID")
 	}
@@ -367,7 +386,7 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 		s.logger.Warn("Project name missing in SaveResult", slog.String("job_id", result.JobID))
 	}
 
-	_, err = s.db.Exec(ctx, upsertResultSQL,
+	_, err := s.db.Exec(ctx, upsertResultSQL,
 		result.JobID,
 		projectName, // Project needed for potential INSERT
 		result.Status,
@@ -379,9 +398,11 @@ func (s *Store) SaveResult(ctx context.Context, result *models.TestResult) error
 		sql.NullFloat64{Float64: result.Duration, Valid: result.Duration > 0},
 		sql.NullTime{Time: result.StartedAt, Valid: !result.StartedAt.IsZero()},
 		sql.NullTime{Time: result.EndedAt, Valid: !result.EndedAt.IsZero()},
+		sql.NullString{String: result.Passrate, Valid: result.Passrate != ""},
+		sql.NullString{String: result.Progress, Valid: result.Progress != ""},
 		result.Screenshots, // Pass slice directly
 		result.Videos,      // Pass slice directly
-		metadataJSON,
+		metadataToStore,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to execute upsert result query for job %s: %w", result.JobID, err)
@@ -396,20 +417,34 @@ func (s *Store) GetResult(ctx context.Context, jobID string) (*models.TestResult
 
 	var logs sql.NullString
 	var duration sql.NullFloat64
-	var startedAt, endedAt sql.NullTime
+	var startedAt, endedAt, enqueuedAt sql.NullTime
+	var detailsJSON []byte
+	var priority sql.NullInt32
+	var metadataJSON []byte // Scan JSONB into []byte
+	var passrate, progress sql.NullString
 	// Assuming result.Messages, result.Screenshots, result.Videos are []string
 	// and result.Metadata is json.RawMessage or []byte, which pgx handles for NULL arrays/JSON.
 
 	err := s.db.QueryRow(ctx, getResultSQL, jobID).Scan(
 		&result.JobID, &result.Project, &result.Status,
-		&logs, // Scan into sql.NullString
+		&detailsJSON, // Scan details
+		&priority,    // Scan priority
+		&enqueuedAt,  // Scan enqueued_at
+		&logs,        // Scan into sql.NullString
 		&result.Messages,
 		&duration,  // Scan into sql.NullFloat64
 		&startedAt, // Scan into sql.NullTime
 		&endedAt,   // Scan into sql.NullTime
-		&result.Screenshots, &result.Videos, &result.Metadata,
+		&passrate, &progress, &result.Screenshots, &result.Videos, &metadataJSON,
 	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil // Job not found, return nil result and nil error
+		}
+		return nil, fmt.Errorf("failed to query result for job %s: %w", jobID, err)
+	}
 
+	// Populate the result struct from scanned values
 	if logs.Valid {
 		result.Logs = logs.String
 	}
@@ -417,16 +452,34 @@ func (s *Store) GetResult(ctx context.Context, jobID string) (*models.TestResult
 		result.Duration = duration.Float64
 	}
 
+	if priority.Valid {
+		result.Priority = uint8(priority.Int32)
+	}
+
+	result.EnqueuedAt = enqueuedAt.Time
 	result.StartedAt = startedAt.Time // If NullTime.Valid is false, Time is zero value, which is fine
 	result.EndedAt = endedAt.Time     // If NullTime.Valid is false, Time is zero value, which is fine
 
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
+	if detailsJSON != nil && string(detailsJSON) != "null" {
+		if errUnmarshal := json.Unmarshal(detailsJSON, &result.Details); errUnmarshal != nil {
+			s.logger.Warn("Failed to unmarshal details JSON for job result", slog.String("job_id", jobID), slog.String("error", errUnmarshal.Error()))
+			// Potentially return error or partial result here, for now, details will be nil/empty
 		}
-		return nil, fmt.Errorf("failed to query result for job %s: %w", jobID, err)
 	}
-
+	if metadataJSON != nil && string(metadataJSON) != "null" {
+		// Unmarshal into map[string]interface{}
+		if errUnmarshal := json.Unmarshal(metadataJSON, &result.Metadata); errUnmarshal != nil {
+			s.logger.Warn("Failed to unmarshal metadata JSON into map[string]interface{}",
+				slog.String("job_id", jobID),
+				slog.String("error", errUnmarshal.Error()))
+		}
+	}
+	if passrate.Valid {
+		result.Passrate = passrate.String
+	}
+	if progress.Valid {
+		result.Progress = progress.String
+	}
 	return result, nil
 }
 
@@ -445,10 +498,11 @@ func (s *Store) GetJobs(ctx context.Context) ([]models.TestJob, error) {
 		var job models.TestJob
 		var detailsJSON []byte
 		var startedAt, endedAt sql.NullTime
+		var passrate, progress sql.NullString
 		var priority sql.NullInt32
 
 		err := rows.Scan(
-			&job.ID, &job.Project, &job.Status, &detailsJSON, &priority, &job.EnqueuedAt, &startedAt, &endedAt,
+			&job.ID, &job.Project, &job.Status, &detailsJSON, &priority, &job.EnqueuedAt, &startedAt, &endedAt, &passrate, &progress,
 		)
 
 		if err != nil {
@@ -463,6 +517,12 @@ func (s *Store) GetJobs(ctx context.Context) ([]models.TestJob, error) {
 		job.EnqueuedAt = enqueuedAtToStore
 		job.StartedAt = startedAt.Time
 		job.EndedAt = endedAt.Time
+		if passrate.Valid {
+			job.Passrate = passrate.String
+		}
+		if progress.Valid {
+			job.Progress = progress.String
+		}
 		if detailsJSON != nil && string(detailsJSON) != "null" {
 			if err := json.Unmarshal(detailsJSON, &job.Details); err != nil {
 				s.logger.Warn("Failed to unmarshal details JSON for active job", slog.String("job_id", job.ID), slog.String("error", err.Error()))
@@ -478,51 +538,59 @@ func (s *Store) GetJobs(ctx context.Context) ([]models.TestJob, error) {
 }
 
 // GetResultsByProject retrieves all test results for a given project.
-func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]models.TestResult, error) {
+func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]models.ProjectResultSummary, error) {
 	rows, err := s.db.Query(ctx, getProjectResultsSQL, project)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to query results for project %s: %w", project, err)
 	}
 	defer rows.Close()
-
-	results := []models.TestResult{}
+	results := []models.ProjectResultSummary{}
 	for rows.Next() {
-		var result models.TestResult
+		var result models.ProjectResultSummary
+		var detailsJSON []byte // For scanning details JSONB
+		var passrate, progress sql.NullString
 		var duration sql.NullFloat64
-		var startedAt, endedAt sql.NullTime
+		var endedAt sql.NullTime // ended_at can be NULL
 		// Ensure the Scan call matches the columns selected in getProjectResultsSQL
 		err := rows.Scan(
 			&result.JobID,
 			&result.Project,
 			&result.Status,
-			&result.Messages, // pgx handles []string for TEXT[]
-			&duration,        // Scan into sql.NullFloat64
-			&startedAt,       // Scan into sql.NullTime
-			&endedAt,         // Scan into sql.NullTime
-			&result.Metadata, // pgx handles json.RawMessage for JSONB
+			&detailsJSON,
+			&endedAt, // Correct order for ended_at (TIMESTAMPTZ)
+			&passrate, &progress, &duration,
 		)
+		if endedAt.Valid {
+			result.EndedAt = endedAt.Time
+		}
 
-		// Assign values from sql.Null* types
+		if detailsJSON != nil && string(detailsJSON) != "null" {
+			if errUnmarshal := json.Unmarshal(detailsJSON, &result.Details); errUnmarshal != nil {
+				s.logger.Warn("Failed to unmarshal details JSON for project result summary", slog.String("job_id", result.JobID), slog.String("error", errUnmarshal.Error()))
+				// result.Details will be nil
+			}
+		}
+		if passrate.Valid {
+			result.Passrate = passrate.String
+		}
+		if progress.Valid {
+			result.Progress = progress.String
+		}
 		if duration.Valid {
 			result.Duration = duration.Float64
 		}
-		result.StartedAt = startedAt.Time // If NullTime.Valid is false, Time is zero value
-		result.EndedAt = endedAt.Time     // If NullTime.Valid is false, Time is zero value
-
 		if err != nil {
 			s.logger.Error("Failed to scan project result row", slog.String("project", project), slog.String("error", err.Error()))
 			continue // Skip this row and try to process others
 		}
 
 		results = append(results, result)
-
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating project result rows for project %s: %w", project, err)
 	}
 	return results, nil
-
 }
 
 // StoreArtifact uploads data to the configured MinIO bucket.
@@ -543,20 +611,30 @@ func (s *Store) StoreArtifact(ctx context.Context, objectName string, reader io.
 }
 
 // UpdateJobStatus updates the status and optionally the started_at time for a job.
-func (s *Store) UpdateJobStatus(ctx context.Context, jobID string, status string) error {
+func (s *Store) UpdateJobStatus(ctx context.Context, jobID string, status string, details map[string]interface{}) error {
 	if jobID == "" {
 		return fmt.Errorf("cannot update status for empty JobID")
 	}
 
-	// Revert to passing sql.NullTime, rely on SQL cast for type inference
 	var startedAtArg sql.NullTime
 	if status == models.StatusRunning {
 		startedAtArg = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	}
-	// Otherwise, startedAtArg remains zero value (Valid=false)
 
-	// Use the SQL query with the explicit cast ::TIMESTAMPTZ
-	cmdTag, err := s.db.Exec(ctx, updateStatusAndStartSQL, jobID, status, startedAtArg)
+	var detailsJSON []byte
+	var err error
+	if details != nil {
+		detailsJSON, err = json.Marshal(details)
+		if err != nil {
+			s.logger.Error("Failed to marshal details for UpdateJobStatus", slog.String("job_id", jobID), slog.String("error", err.Error()))
+			return fmt.Errorf("failed to marshal details for job %s: %w", jobID, err)
+		}
+	} else {
+		// Pass NULL to SQL if details map is nil, so COALESCE or CASE WHEN can preserve existing DB value.
+		detailsJSON = nil // pgx will interpret nil []byte as NULL for JSONB if the query handles it.
+	}
+
+	cmdTag, err := s.db.Exec(ctx, updateStatusAndStartSQL, jobID, status, startedAtArg, detailsJSON)
 	if err != nil {
 		return fmt.Errorf("failed to execute update status query for job %s: %w", jobID, err)
 	}
@@ -565,6 +643,54 @@ func (s *Store) UpdateJobStatus(ctx context.Context, jobID string, status string
 		return nil // Treat as non-critical if job wasn't found
 	}
 	s.logger.Info("Updated job status in storage", slog.String("job_id", jobID), slog.String("new_status", status))
+	return nil
+}
+
+// UpdateJobProgress updates the job's status, appends to logs, and merges metadata.
+func (s *Store) UpdateJobProgress(ctx context.Context, jobID string, progress *models.JobProgressUpdate) error {
+	if jobID == "" {
+		return errors.New("job ID cannot be empty for progress update")
+	}
+	if progress == nil {
+		return errors.New("progress update data cannot be nil")
+	}
+
+	var statusArg sql.NullString
+	if progress.Status != nil {
+		statusArg = sql.NullString{String: *progress.Status, Valid: true}
+	}
+
+	var logsChunkArg sql.NullString
+	if progress.LogsChunk != nil {
+		logsChunkArg = sql.NullString{String: *progress.LogsChunk, Valid: true}
+	}
+
+	var messagesChunkArg []string // pgx handles []string for TEXT[] directly, including nil
+	if progress.MessagesChunk != nil && len(progress.MessagesChunk) > 0 {
+		messagesChunkArg = progress.MessagesChunk
+	}
+
+	var passrateArg sql.NullString
+	if progress.Passrate != nil {
+		passrateArg = sql.NullString{String: *progress.Passrate, Valid: true}
+	}
+
+	var progressArg sql.NullString
+	if progress.Progress != nil {
+		progressArg = sql.NullString{String: *progress.Progress, Valid: true}
+	}
+
+	cmdTag, err := s.db.Exec(ctx, updateJobProgressSQL, jobID, statusArg, logsChunkArg, messagesChunkArg, passrateArg, progressArg)
+	if err != nil {
+		return fmt.Errorf("failed to execute update job progress query for job %s: %w", jobID, err)
+	}
+
+	if cmdTag.RowsAffected() == 0 {
+		s.logger.Warn("Attempted to update progress for non-existent job", slog.String("job_id", jobID))
+		return fmt.Errorf("job with ID %s not found for progress update", jobID) // Or return nil if "not found" is acceptable
+	}
+
+	s.logger.Info("Updated job progress in storage", slog.String("job_id", jobID))
 	return nil
 }
 

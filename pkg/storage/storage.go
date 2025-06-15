@@ -25,10 +25,13 @@ type ResultStore interface {
 	GetJobs(ctx context.Context) ([]models.TestJob, error)
 
 	// GetResultsByProject retrieves all test results for a given project.
-	GetResultsByProject(ctx context.Context, project string) ([]models.TestResult, error)
+	GetResultsByProject(ctx context.Context, project string) ([]models.ProjectResultSummary, error)
 
 	// UpdateJobStatus updates the status and potentially other fields (like started_at) for a job.
-	UpdateJobStatus(ctx context.Context, jobID string, status string) error
+	UpdateJobStatus(ctx context.Context, jobID string, status string, details map[string]interface{}) error
+
+	// UpdateJobProgress updates parts of a job's result in real-time, like status, logs, and metadata.
+	UpdateJobProgress(ctx context.Context, jobID string, progress *models.JobProgressUpdate) error
 
 	// CountJobsByStatus counts the number of jobs for a given project and status.
 	CountJobsByStatus(ctx context.Context, project string, status string) (int, error)

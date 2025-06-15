@@ -1,6 +1,8 @@
 package models
 
-import "time"
+import (
+	"time"
+)
 
 // TestRequest is the data received to enqueue a new test run
 type TestRequest struct {
@@ -21,6 +23,8 @@ type TestJob struct {
 	// Status can be updated in storage, might differ from queue status if tracked separately
 	Status         string    `json:"status"`
 	AssignedRunner string    `json:"assigned_runner,omitempty"` // ID of the runner processing it
+	Passrate       string    `json:"passrate,omitempty"`        // Passrate string
+	Progress       string    `json:"progress,omitempty"`        // Progress string
 	StartedAt      time.Time `json:"started_at,omitempty"`      // Set when runner starts
 	EndedAt        time.Time `json:"ended_at,omitempty"`        // Set when runner finishes (or server marks completion)
 }
@@ -30,6 +34,9 @@ type TestResult struct {
 	JobID       string                 `json:"job_id"`                // Usually taken from URL path, not body
 	Status      string                 `json:"status"`                // Final status: PASSED, FAILED, ERROR, SKIPPED
 	Project     string                 `json:"project"`               // Project title
+	Details     map[string]interface{} `json:"details"`               // Details provided in the original request
+	Priority    uint8                  `json:"priority"`              // Priority the job was enqueued with
+	EnqueuedAt  time.Time              `json:"enqueued_at"`           // Time the job was added to the queue
 	Logs        string                 `json:"logs,omitempty"`        // Captured logs (can be large)
 	Messages    []string               `json:"messages,omitempty"`    // Status messages during the run
 	Duration    float64                `json:"duration_seconds"`      // How long the test took in seconds
@@ -37,7 +44,21 @@ type TestResult struct {
 	EndedAt     time.Time              `json:"ended_at"`              // When the runner finished the job
 	Screenshots []string               `json:"screenshots,omitempty"` // URLs/paths to stored screenshots
 	Videos      []string               `json:"videos,omitempty"`      // URLs/paths to stored videos
+	Passrate    string                 `json:"passrate,omitempty"`    // Passrate string, e.g., "85%" or "10/12"
+	Progress    string                 `json:"progress,omitempty"`    // Progress string, e.g., "Step 5/10" or "75%"
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`    // Any other specific result data
+}
+
+// ProjectResultSummary is a concise representation of a test result for project listings.
+type ProjectResultSummary struct {
+	JobID    string                 `json:"job_id"`
+	Project  string                 `json:"project"`
+	Status   string                 `json:"status"`
+	Details  map[string]interface{} `json:"details,omitempty"`          // Added details
+	Passrate string                 `json:"passrate,omitempty"`         // Passrate string
+	Progress string                 `json:"progress,omitempty"`         // Progress string
+	Duration float64                `json:"duration_seconds,omitempty"` // How long the test took in seconds
+	EndedAt  time.Time              `json:"ended_at,omitempty"`         // Use EndedAt for recency sorting
 }
 
 // Constants for Job Status
@@ -61,4 +82,13 @@ type JobMessage struct {
 	Details    map[string]interface{} `json:"details"`
 	Priority   uint8                  `json:"priority"`
 	EnqueuedAt time.Time              `json:"enqueued_at"`
+}
+
+// JobProgressUpdate is the data received to update a job's progress in real-time.
+type JobProgressUpdate struct {
+	Status        *string  `json:"status,omitempty"`         // Optional: new status
+	LogsChunk     *string  `json:"logs_chunk,omitempty"`     // Optional: new chunk of logs to append
+	MessagesChunk []string `json:"messages_chunk,omitempty"` // Optional: new messages to append
+	Passrate      *string  `json:"passrate,omitempty"`       // Optional: new passrate string
+	Progress      *string  `json:"progress,omitempty"`       // Optional: new progress string
 }

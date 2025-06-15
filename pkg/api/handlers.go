@@ -262,8 +262,22 @@ func (a *API) HandleGetNextTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Update status to RUNNING in DB
+	// Prepare details to update, including runner information.
+	updatedDetails := dbJobState.Details // Get existing details from the fetched TestResult
+	if updatedDetails == nil {
+		updatedDetails = make(map[string]interface{})
+	}
+
+	// Add runner information.
+	runnerID := r.Header.Get("X-Runner-ID") // Attempt to get runner ID from a custom header
+	if runnerID == "" {
+		runnerID = "unknown" // Default if header is not present
+	}
+	updatedDetails["runner_id"] = runnerID
+
 	// The UpdateJobStatus method also sets started_at when status is RUNNING.
-	if updateErr := a.ResultStore.UpdateJobStatus(r.Context(), jobFromQueue.ID, models.StatusRunning); updateErr != nil {
+	if updateErr := a.ResultStore.UpdateJobStatus(r.Context(), jobFromQueue.ID, models.StatusRunning, updatedDetails); updateErr != nil {
+
 		logger.Error("Failed to update job status to RUNNING in DB", slog.String("job_id", jobFromQueue.ID), slog.String("error", updateErr.Error()))
 		// If UpdateJobStatus fails (e.g., DB error, or if it were to return ErrNotFound because job disappeared),
 		// Nack the message.
@@ -277,6 +291,7 @@ func (a *API) HandleGetNextTest(w http.ResponseWriter, r *http.Request) {
 	// Prepare job to send to runner
 	jobToRunner := jobFromQueue // This is *models.TestJob
 	jobToRunner.Status = models.StatusRunning
+	jobToRunner.Details = updatedDetails     // Ensure the details sent back include the runner_id
 	jobToRunner.StartedAt = time.Now().UTC() // Set for the response; DB also has its own timestamp.
 
 	// Send response to runner
@@ -499,7 +514,7 @@ func (a *API) HandleGetJobs(w http.ResponseWriter, r *http.Request) {
 
 // HandleGetProjectResults retrieves all results for a specific project.
 func (a *API) HandleGetProjectResults(w http.ResponseWriter, r *http.Request) {
-	project := chi.URLParam(r, "project")
+	project := chi.URLParam(r, "projectName")
 	logger := a.Logger.With(slog.String("handler", "HandleGetProjectResults"), slog.String("project", project))
 	if project == "" {
 		httperrors.BadRequest(w, logger, nil, "Missing project name")
@@ -525,7 +540,7 @@ func (a *API) HandleGetProjectResults(w http.ResponseWriter, r *http.Request) {
 func (a *API) HandleCancelJob(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "jobId")
 	logger := a.Logger.With(slog.String("handler", "HandleCancelJob"), slog.String("job_id", jobID))
-	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusCancelled)
+	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusCancelled, nil)
 	if err != nil {
 		httperrors.InternalServerError(w, logger, err, "Failed to request job cancellation")
 		return
@@ -537,7 +552,7 @@ func (a *API) HandleCancelJob(w http.ResponseWriter, r *http.Request) {
 func (a *API) HandleSkipJob(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "jobId")
 	logger := a.Logger.With(slog.String("handler", "HandleSkipJob"), slog.String("job_id", jobID))
-	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusSkipped)
+	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusSkipped, nil)
 	if err != nil {
 		httperrors.InternalServerError(w, logger, err, "Failed to skip job")
 		return
@@ -559,7 +574,7 @@ func (a *API) HandleRerunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	project := originalResult.Project  // Use project from fetched result
-	details := originalResult.Metadata // Assuming details were stored in metadata
+	details := originalResult.Details  // Original run details
 	priority := uint8(defaultPriority) // Use default priority for rerun? Or original? // FIXME: Get original priority if needed
 	newJobID, err := a.QueueManager.EnqueueJob(project, details, priority)
 	if err != nil {
@@ -574,7 +589,7 @@ func (a *API) HandleRerunJob(w http.ResponseWriter, r *http.Request) {
 func (a *API) HandleAbortJob(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "jobId")
 	logger := a.Logger.With(slog.String("handler", "HandleAbortJob"), slog.String("job_id", jobID))
-	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusAbortRequested)
+	err := a.ResultStore.UpdateJobStatus(r.Context(), jobID, models.StatusAbortRequested, nil)
 	if err != nil {
 		httperrors.InternalServerError(w, logger, err, "Failed to request job abortion")
 		return
@@ -582,6 +597,39 @@ func (a *API) HandleAbortJob(w http.ResponseWriter, r *http.Request) {
 	logger.Info("Job status marked as ABORT_REQUESTED in storage")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Abort request processed for job %s.", jobID)
+}
+
+// HandleUpdateJobProgress handles real-time updates to a job's progress.
+func (a *API) HandleUpdateJobProgress(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "jobId")
+	logger := a.Logger.With(slog.String("handler", "HandleUpdateJobProgress"), slog.String("job_id", jobID))
+
+	if jobID == "" {
+		httperrors.BadRequest(w, logger, nil, "Missing job ID in URL path")
+		return
+	}
+
+	var progressUpdate models.JobProgressUpdate
+	if err := json.NewDecoder(r.Body).Decode(&progressUpdate); err != nil {
+		httperrors.BadRequest(w, logger, err, "Invalid JSON request body for progress update")
+		return
+	}
+	defer r.Body.Close()
+
+	// Call the storage method to update progress
+	if err := a.ResultStore.UpdateJobProgress(r.Context(), jobID, &progressUpdate); err != nil {
+		// Check if the error is because the job was not found, or a general DB error
+		// The current store implementation returns an error if RowsAffected is 0.
+		if err.Error() == fmt.Sprintf("job with ID %s not found for progress update", jobID) { // Basic check
+			httperrors.NotFound(w, logger, err, fmt.Sprintf("Job %s not found for progress update", jobID))
+		} else {
+			httperrors.InternalServerError(w, logger, err, "Failed to update job progress")
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Job progress updated successfully", "job_id": jobID})
 }
 
 // Helper remains the same
