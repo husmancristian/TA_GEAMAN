@@ -375,6 +375,10 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 				if key == "videos" {
 					videoURLs = append(videoURLs, artifactURL)
 				}
+				if key == "log_file" { // Add this condition
+					result.Logs = artifactURL // Assign the log file URL to result.Logs
+					logger.Info("Assigned log_file URL to result.Logs", slog.String("url", result.Logs))
+				}
 
 				// else { logger.Warn("Uploaded file in unexpected field", slog.String("field", key)) }
 			}
@@ -383,6 +387,7 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	result.Screenshots = screenshotURLs
 	result.Videos = videoURLs
 
+	logger.Info("Calling SaveResult with result.Logs", slog.String("job_id", result.JobID), slog.String("logs_value", result.Logs))
 	// SaveResult performs UPSERT, updating status and other fields
 	err = a.ResultStore.SaveResult(r.Context(), &result)
 	if err != nil {
@@ -390,8 +395,12 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Return the updated result object, which now includes the log file URL
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Result for job %s saved successfully.", jobID)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		logger.Error("Failed to encode result response after saving", slog.String("error", err.Error()))
+	}
 }
 
 // HandleGetResult remains the same
