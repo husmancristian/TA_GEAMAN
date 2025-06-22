@@ -2,5 +2,3 @@
 # Environment variables file - contains secrets
 .env
 *.exe
-runner.go
-\automation
