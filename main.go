@@ -100,16 +100,17 @@ func main() {
 		BaseContext:  func(_ net.Listener) context.Context { return ctx }, // Use app context
 	}
 
-	// Define paths to your TLS certificate and key files
-	// These could come from your config (cfg.CertFile, cfg.KeyFile)
-	certFile := "C:\\Users\\husma\\OneDrive\\Documents\\Licenta\\localhost+2.pem"    //
-	keyFile := "C:\\Users\\husma\\OneDrive\\Documents\\Licenta\\localhost+2-key.pem" //
+	// Certificate paths now come from your configuration
+	certFile := cfg.CertFile
+	keyFile := cfg.KeyFile
 
 	// --- Start Server Goroutine ---
 	go func() {
-		// Check if cert and key files exist to decide whether to run HTTP or HTTPS
-		// For simplicity here, we assume they exist if you want HTTPS.
-		// In a real app, you might check os.Stat and fallback to HTTP or error out.
+		if certFile == "" || keyFile == "" {
+			slog.Error("CERT_FILE and KEY_FILE environment variables must be set for HTTPS")
+			stop() // Trigger shutdown
+			return
+		}
 		logger.Info("Server listening with HTTPS...", slog.String("address", server.Addr))
 		if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTPS Server failed to start or unexpectedly closed", slog.String("error", err.Error()))

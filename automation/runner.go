@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
+	"net/url"
+	"path"
+
 	"net/http"
 	"os"
 	"os/exec"
@@ -119,11 +123,21 @@ func main() {
 
 	log.Printf("Runner started. \n ID: %s \n API: %s \n PollingInterval: %d seconds \n Assigned Projects: %v", runnerID, apiBaseURL, pollingIntervalSeconds, assignedProjects)
 
-	// Initialize HTTP client
-	// For local development with self-signed certificates, you might need to skip verification.
-	// IMPORTANT: Do NOT use InsecureSkipVerify in production.
+	// --- Initialize secure HTTP client ---
+	// Load the server's self-signed certificate to trust it.
+	caCert, err := os.ReadFile("localhost+2.pem")
+	if err != nil {
+		log.Fatalf("Error reading server certificate file: %v", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // <<< Use with caution for local dev only
+		// Use the certificate pool to validate the server's certificate.
+		// This is the secure alternative to InsecureSkipVerify.
+		TLSClientConfig: &tls.Config{
+			RootCAs: caCertPool,
+		},
 	}
 	httpClient = &http.Client{
 		Timeout:   time.Second * 30, // Set a reasonable timeout
@@ -359,11 +373,61 @@ func isTerminalStatus(status string) bool {
 	}
 }
 
+// getLocalPathFromURL derives a local directory name from a git repository URL.
+// e.g., "https://github.com/user/repo.git" -> "repo"
+func getLocalPathFromURL(repoURL string) (string, error) {
+	parsedURL, err := url.Parse(repoURL)
+	if err != nil {
+		return "", err
+	}
+	// Get the last part of the path
+	localPath := path.Base(parsedURL.Path)
+	// Remove .git suffix if it exists
+	localPath = strings.TrimSuffix(localPath, ".git")
+	if localPath == "" || localPath == "." || localPath == "/" {
+		return "", fmt.Errorf("could not determine a valid directory name from URL")
+	}
+	return localPath, nil
+}
+
 func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output *TestResult, attachments []FileAttachment, scriptLogs string, err error) {
 	// This function uses job.Details (and other fields from 'job') as fetched by getNextJob.
 	log.Printf("[%s]  executeScript: Starting for job ID: %s. Details: %+v.", job.ID, job.ID, job.Details)
-	// Access "details"
 
+	// --- Git Clone/Pull Logic ---
+	var executionDir string // This will be the directory to run the script from.
+	if scriptSourceURL, ok := job.Details["script_source"].(string); ok && scriptSourceURL != "" {
+		localRepoPath, pathErr := getLocalPathFromURL(scriptSourceURL)
+		if pathErr != nil {
+			log.Printf("[%s] Warning: Could not derive local path from script source URL '%s': %v. Will attempt to run with local sources.", job.ID, scriptSourceURL, pathErr)
+		} else {
+			// Check if the directory exists
+			if _, statErr := os.Stat(localRepoPath); os.IsNotExist(statErr) {
+				// Directory does not exist, so clone it
+				log.Printf("[%s] Cloning repository from %s into %s", job.ID, scriptSourceURL, localRepoPath)
+				gitCmd := exec.Command("git", "clone", scriptSourceURL, localRepoPath)
+				output, gitErr := gitCmd.CombinedOutput()
+				if gitErr != nil {
+					log.Printf("[%s] Warning: 'git clone' failed: %v. Output: %s. Will attempt to run with local sources.", job.ID, gitErr, string(output))
+				} else {
+					executionDir = localRepoPath // Set execution dir on successful clone
+				}
+			} else {
+				// Directory exists, so pull latest changes
+				log.Printf("[%s] Pulling latest changes for repository in %s", job.ID, localRepoPath)
+				gitCmd := exec.Command("git", "pull")
+				gitCmd.Dir = localRepoPath // Run 'git pull' inside the repo directory
+				output, gitErr := gitCmd.CombinedOutput()
+				if gitErr != nil {
+					log.Printf("[%s] Warning: 'git pull' failed: %v. Output: %s. Will attempt to run with local sources.", job.ID, gitErr, string(output))
+				}
+				// Even if pull fails, we can still try to run from this directory.
+				executionDir = localRepoPath
+			}
+		}
+	}
+
+	// Initialize the result object that will be populated and returned.
 	result := &TestResult{
 		JobID:      job.ID,
 		Project:    job.Project,
@@ -376,8 +440,11 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 	if scriptCommandStr, ok := job.Details["script_command"].(string); ok {
 		parts := strings.Fields(scriptCommandStr)
 		if len(parts) == 0 {
-			log.Printf("[%s] Error: 'script_command' is empty after splitting.", job.ID)
-			return
+			errMsg := "Error: 'script_command' is empty after splitting."
+			log.Printf("[%s] %s", job.ID, errMsg)
+			result.Status = "ERROR"
+			result.Logs = errMsg
+			return result, nil, "", fmt.Errorf(errMsg)
 		}
 
 		command := parts[0]
@@ -385,8 +452,7 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 		if len(parts) > 1 {
 			args = parts[1:]
 		}
-		// args = append(args, job.Details["details"].(string))
-		// fmt.Printf("Executing command: %s with args: %v\n", command, args)
+
 		// Marshal the inner 'details' map (which is job.Details["details"]) to a JSON string
 		innerDetailsJSON, errMarshal := json.Marshal(job.Details)
 		if errMarshal != nil {
@@ -396,9 +462,14 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 		}
 		args = append(args, string(innerDetailsJSON))
 
-		log.Printf("[%s] Executing command: %s with args: %v", job.ID, command, args)
-
 		cmd := exec.Command(command, args...)
+		if executionDir != "" {
+			cmd.Dir = executionDir
+			log.Printf("[%s] Executing command '%s' with args %v in directory: %s", job.ID, command, args, executionDir)
+		} else {
+			log.Printf("[%s] Executing command '%s' with args %v in runner's working directory.", job.ID, command, args)
+		}
+
 		commandOutput, commandErr := cmd.CombinedOutput() // Captures both stdout and stderr
 		fmt.Println("Command executed.")
 
@@ -447,21 +518,22 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			testResult.Messages = append(testResult.Messages, fmt.Sprintf("Script execution error: %v", commandErr))
 
 			if errors.Is(ctx.Err(), context.Canceled) { // Check if cancellation was the cause
-				result.Status = "ABORTED"
+				testResult.Status = "ABORTED"
 			} else if result.Status == "" || result.Status == "RUNNING" || !isTerminalStatus(result.Status) {
 				// If script didn't set a terminal status, or it's still "RUNNING" (or other non-terminal), mark as FAILED
-				result.Status = "FAILED"
+				testResult.Status = "FAILED"
 			}
-
-			testResult.Status = "FAILED"
 			return testResult, attachments, string(commandOutput), commandErr
 		}
 
 		return result, attachments, string(commandOutput), commandErr
 
 	} else {
-		fmt.Println("Error: 'script_command' is empty after splitting.")
-		return
+		errMsg := "Error: 'script_command' not found or is not a string."
+		log.Printf("[%s] %s", job.ID, errMsg)
+		result.Status = "ERROR"
+		result.Logs = errMsg
+		return result, nil, "", fmt.Errorf(errMsg)
 	}
 }
 

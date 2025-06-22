@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # --- Infrastructure Services ---
+  postgres:
+    image: postgres:13-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=ta_geaman_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000" # API Port
+      - "9001:9001" # Console Port
+    volumes:
+      - minio_data:/data
+
+  rabbitmq:
+    image: rabbitmq:3.9-management-alpine
+    environment:
+      - RABBITMQ_DEFAULT_USER=user
+      - RABBITMQ_DEFAULT_PASS=password
+    ports:
+      - "5672:5672"   # AMQP Port
+      - "15672:15672" # Management UI Port
+
+  # --- Application Services ---
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "8443:8443"
+    environment:
+      - PORT=8443
+      - LOG_LEVEL=debug
+      - REQUEST_TIMEOUT=30s
+      - POSTGRES_DSN=postgres://user:password@postgres:5432/ta_geaman_db?sslmode=disable
+      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET_NAME=ta-geaman-results
+      - MINIO_USE_SSL=false
+      - DELETE_PROTECTION_KEY=supersecret
+      - CERT_FILE=./localhost+2.pem
+      - KEY_FILE=./localhost+2-key.pem
+    depends_on:
+      - postgres
+      - rabbitmq
+      - minio
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    environment:
+      - RUNNER_ID=docker-runner-01
+      - API_BASE_URL=https://server:8443/api/v1
+      - ASSIGNED_PROJECTS=VPN_Desktop,AnotherProject
+      - POLLING_INTERVAL_SECONDS=15
+    depends_on:
+      - server
+
+# Define persistent volumes
+volumes:
+  postgres_data:
+  minio_data:

@@ -2,3 +2,4 @@
 # Environment variables file - contains secrets
 .env
 *.exe
+*.pem

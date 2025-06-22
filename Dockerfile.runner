@@ -1,0 +1,22 @@
+# Stage 1: Build the Go application
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Copy go.mod and go.sum to leverage Docker cache for dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the application source code
+COPY . .
+
+# Build the runner binary from its location
+RUN go build -o /runner ./automation/runner.go
+
+# Stage 2: Create the final image with runtime dependencies
+FROM alpine:latest
+RUN apk add --no-cache git python3 py3-pip && ln -sf python3 /usr/bin/py
+WORKDIR /app
+COPY localhost+2.pem .
+COPY --from=builder /runner .
+CMD ["./runner"]

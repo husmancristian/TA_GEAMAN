@@ -19,6 +19,8 @@ type Config struct {
 	LogLevel            string // e.g., "debug", "info", "warn", "error"
 	RequestTimeout      time.Duration
 	DeleteProtectionKey string // Key to protect project deletion
+	CertFile            string // Path to TLS certificate file
+	KeyFile             string // Path to TLS key file
 
 	// Projects         []string // REMOVED: Projects will be managed via DB and cached in API
 }
@@ -67,6 +69,8 @@ func Load() (*Config, error) {
 		LogLevel:            getenv("LOG_LEVEL", "info"),
 		RequestTimeout:      getenvDuration("REQUEST_TIMEOUT", 15*time.Second),
 		DeleteProtectionKey: getenv("DELETE_PROTECTION_KEY", ""), // Default to empty, should be set for protection
+		CertFile:            getenv("CERT_FILE", ""),             // Default to empty, should be set for HTTPS
+		KeyFile:             getenv("KEY_FILE", ""),              // Default to empty, should be set for HTTPS
 		// Projects are no longer loaded from env. They are managed via DB.
 	}
 
