@@ -1,5 +1,11 @@
 
 # Environment variables file - contains secrets
 .env
+
+# Compiled binaries
 *.exe
-*.pem
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/

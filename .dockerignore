@@ -1,0 +1,11 @@
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+docker-compose.yml
+
+# Local development
+.env
+*.exe # Ignore local windows executables

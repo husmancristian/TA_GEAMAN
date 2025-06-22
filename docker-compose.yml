@@ -1,38 +1,53 @@
-version: '3.8'
 
 services:
   # --- Infrastructure Services ---
   postgres:
     image: postgres:13-alpine
     environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=ta_geaman_db
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s # Give MinIO time to start before the first check
     environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
     ports:
-      - "9000:9000" # API Port
-      - "9001:9001" # Console Port
+      - "${MINIO_API_PORT}:9000" # API Port
+      - "${MINIO_CONSOLE_PORT}:9001" # Console Port
     volumes:
       - minio_data:/data
 
   rabbitmq:
     image: rabbitmq:3.9-management-alpine
     environment:
-      - RABBITMQ_DEFAULT_USER=user
-      - RABBITMQ_DEFAULT_PASS=password
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
     ports:
-      - "5672:5672"   # AMQP Port
-      - "15672:15672" # Management UI Port
+      - "${RABBITMQ_NODE_PORT}:5672"   # AMQP Port
+      - "${RABBITMQ_MANAGEMENT_PORT}:15672" # Management UI Port
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # --- Application Services ---
   server:
@@ -40,37 +55,44 @@ services:
       context: .
       dockerfile: Dockerfile.server
     ports:
-      - "8443:8443"
+      - "${PORT}:8443"
     environment:
-      - PORT=8443
-      - LOG_LEVEL=debug
-      - REQUEST_TIMEOUT=30s
-      - POSTGRES_DSN=postgres://user:password@postgres:5432/ta_geaman_db?sslmode=disable
-      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - MINIO_BUCKET_NAME=ta-geaman-results
+      - PORT=${PORT}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
+      - POSTGRES_DSN=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      - MINIO_ENDPOINT=minio:${MINIO_API_PORT}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME}
       - MINIO_USE_SSL=false
-      - DELETE_PROTECTION_KEY=supersecret
-      - CERT_FILE=./localhost+2.pem
-      - KEY_FILE=./localhost+2-key.pem
+      - DELETE_PROTECTION_KEY=${DELETE_PROTECTION_KEY}
+      - CERT_FILE=${CERT_FILE}
+      - KEY_FILE=${KEY_FILE}
     depends_on:
-      - postgres
-      - rabbitmq
-      - minio
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./${CERT_FILE}:/app/${CERT_FILE}:ro
+      - ./${KEY_FILE}:/app/${KEY_FILE}:ro
 
   runner:
     build:
       context: .
       dockerfile: Dockerfile.runner
     environment:
-      - RUNNER_ID=docker-runner-01
+      - RUNNER_ID=${RUNNER_ID:-docker-runner-01} # Use default if not set in .env
       - API_BASE_URL=https://server:8443/api/v1
-      - ASSIGNED_PROJECTS=VPN_Desktop,AnotherProject
-      - POLLING_INTERVAL_SECONDS=15
+      - ASSIGNED_PROJECTS=${ASSIGNED_PROJECTS:-ProjectA,ProjectB}
+      - POLLING_INTERVAL_SECONDS=${POLLING_INTERVAL_SECONDS:-15}
     depends_on:
-      - server
+      server:
+        condition: service_started # The runner can start once the server starts
 
 # Define persistent volumes
 volumes:

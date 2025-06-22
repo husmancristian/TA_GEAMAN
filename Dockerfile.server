@@ -1,5 +1,5 @@
 # Stage 1: Build the Go application
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -17,6 +17,5 @@ RUN go build -o /server main.go
 FROM alpine:latest
 WORKDIR /app
 COPY --from=builder /server .
-COPY localhost+2.pem localhost+2-key.pem ./
 EXPOSE 8443
 CMD ["./server"]

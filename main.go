@@ -26,13 +26,15 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger) // Set as default logger for convenience
 
-	// --- Load .env file ---
-	// Load .env file before loading configuration.
-	// This is useful for local development. In production, environment variables are usually set directly.
-	if err := godotenv.Load(); err != nil {
-		logger.Info("No .env file found or error loading .env file, relying on environment variables", slog.String("error", err.Error()))
-	} else {
-		logger.Info("Loaded .env file")
+	// --- Load .env file (for local development only) ---
+	// Only attempt to load a .env file if APP_ENV is not 'production'.
+	// This keeps container logs clean.
+	if os.Getenv("APP_ENV") != "production" {
+		if err := godotenv.Load(); err != nil {
+			logger.Info("Could not load .env file, relying on environment variables", slog.String("error", err.Error()))
+		} else {
+			logger.Info("Loaded configuration from .env file for local development")
+		}
 	}
 
 	// --- Configuration Loading ---
@@ -40,6 +42,12 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Explicitly check if the PostgreSQL DSN is loaded correctly
+	if cfg.Postgres_DSN == "" {
+		logger.Error("PostgreSQL DSN (POSTGRES_DSN) is empty in configuration. Please ensure it's set correctly in .env or environment variables.", slog.String("dsn_from_config", cfg.Postgres_DSN))
+		os.Exit(1) // Exit early if DSN is not set, as database connection will fail
 	}
 
 	switch cfg.LogLevel {
@@ -111,8 +119,10 @@ func main() {
 			stop() // Trigger shutdown
 			return
 		}
-		logger.Info("Server listening with HTTPS...", slog.String("address", server.Addr))
-		if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Info("Server starting on address", "protocol", "https", "address", server.Addr)
+		if err := server.ListenAndServeTLS(certFile, keyFile); errors.Is(err, syscall.EADDRINUSE) {
+			logger.Error("Port is already in use. Is another instance of the server (or the Docker container) already running?", slog.String("address", server.Addr))
+		} else if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTPS Server failed to start or unexpectedly closed", slog.String("error", err.Error()))
 			// Fallback or alternative: logger.Info("Attempting to start HTTP server as HTTPS failed...")
 			// if errHttp := server.ListenAndServe(); errHttp != nil && !errors.Is(errHttp, http.ErrServerClosed) { ... }

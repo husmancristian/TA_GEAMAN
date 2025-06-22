@@ -145,6 +145,8 @@ const (
 			duration_seconds DOUBLE PRECISION,
 			started_at TIMESTAMPTZ,
 			ended_at TIMESTAMPTZ,
+			passrate TEXT,
+			progress TEXT,
 			screenshots TEXT[],
 			videos TEXT[],
 			metadata JSONB,
@@ -299,13 +301,10 @@ func NewStore(pgDSN, minioEndpoint, minioAccessKey, minioSecretKey, bucketName s
 
 	err = minioClient.SetBucketPolicy(bucketCtx, bucketName, policy)
 	if err != nil {
-		// Log a warning. Depending on your deployment, you might want to treat this as a fatal error.
-		// If the policy is already set or managed externally, this error might be benign.
-		logger.Warn("Failed to set public read policy on MinIO bucket. Artifacts may not be accessible via public URLs.",
-			slog.String("bucket", bucketName), slog.String("error", err.Error()))
-		// Example: To make it fatal:
-		// dbpool.Close()
-		// return nil, fmt.Errorf("failed to set public read policy on MinIO bucket '%s': %w", bucketName, err)
+		// Treat failure to set the bucket policy as a fatal error during startup.
+		// If artifacts are not publicly readable, a core feature is broken.
+		dbpool.Close()
+		return nil, fmt.Errorf("failed to set public read policy on MinIO bucket '%s': %w", bucketName, err)
 	} else {
 		logger.Info("Successfully set public read policy on MinIO bucket", slog.String("bucket", bucketName))
 	}

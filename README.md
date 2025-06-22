@@ -13,7 +13,7 @@ docker-compose up --build --scale runner=3 ||||| - everything + 3 instances of r
 docker-compose up --build server ( -d for detached ) ||||  - for central server
 docker-compose up -d postgres minio rabbitmq ||||  -without central server 
 
-docker exec -it test-db psql -U user -d test_results_db - database 
+docker exec -it ta_geaman-postgres-1 psql -U user -d test_results_db  - database 
 
 
 docker build -t ta-geaman-runner -f Dockerfile.runner .
