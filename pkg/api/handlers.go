@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync" // Added for mutex
 	"time"
 
@@ -361,39 +363,39 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		result.Duration = result.EndedAt.Sub(result.StartedAt).Seconds()
 	}
 
-	screenshotURLs := []string{}
+	screenshotObjectNames := []string{}
+	videoObjectNames := []string{}
 
-	videoURLs := []string{}
 	if r.MultipartForm != nil && r.MultipartForm.File != nil {
 		for key, fileHeaders := range r.MultipartForm.File {
 			for _, fh := range fileHeaders {
-				logger.Info("Processing uploaded file", slog.String("field", key), slog.String("filename", fh.Filename))
-				artifactURL, err := parseAndStoreFile(r.Context(), a.ResultStore, fh, jobID, logger)
-				logger.Info("artifactURL ", slog.String("artifactURL", artifactURL))
+				logger.Info("Processing uploaded file", slog.String("field", key), slog.String("filename", fh.Filename)) // The return value is now an object name, not a full URL.
+				objectName, err := parseAndStoreFile(r.Context(), a.ResultStore, fh, jobID, logger)
+				logger.Info("Stored artifact", slog.String("object_name", objectName))
 
 				if err != nil {
 					httperrors.InternalServerError(w, logger, err, "Failed to store artifact")
 					return
 				}
 				if key == "screenshots" {
-					screenshotURLs = append(screenshotURLs, artifactURL)
+					screenshotObjectNames = append(screenshotObjectNames, objectName)
 				}
 				if key == "videos" {
-					videoURLs = append(videoURLs, artifactURL)
+					videoObjectNames = append(videoObjectNames, objectName)
 				}
-				if key == "log_file" { // Add this condition
-					result.Logs = artifactURL // Assign the log file URL to result.Logs
-					logger.Info("Assigned log_file URL to result.Logs", slog.String("url", result.Logs))
+				if key == "log_file" {
+					result.Logs = objectName // Assign the log file object name to result.Logs
+					logger.Info("Assigned log_file object name to result.Logs", slog.String("object_name", result.Logs))
 				}
 
 				// else { logger.Warn("Uploaded file in unexpected field", slog.String("field", key)) }
 			}
 		}
 	}
-	result.Screenshots = screenshotURLs
-	result.Videos = videoURLs
+	result.Screenshots = screenshotObjectNames
+	result.Videos = videoObjectNames
 
-	logger.Info("Calling SaveResult with result.Logs", slog.String("job_id", result.JobID), slog.String("logs_value", result.Logs))
+	logger.Info("Calling SaveResult with artifact object names", slog.String("job_id", result.JobID), slog.String("logs_object", result.Logs))
 	// SaveResult performs UPSERT, updating status and other fields
 	err = a.ResultStore.SaveResult(r.Context(), &result)
 	if err != nil {
@@ -401,7 +403,7 @@ func (a *API) HandleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return the updated result object, which now includes the log file URL
+	// Return the result object. The frontend will get presigned URLs from the GetResult endpoint.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(result); err != nil {
@@ -426,6 +428,56 @@ func (a *API) HandleGetResult(w http.ResponseWriter, r *http.Request) {
 	if result == nil {
 		httperrors.NotFound(w, logger, nil, "Result not found")
 		return
+	}
+
+	// --- Generate presigned URLs for all artifacts before sending to client ---
+
+	// Generate for Screenshots
+	if len(result.Screenshots) > 0 {
+		presignedScreenshots := make([]string, 0, len(result.Screenshots))
+		for _, objectName := range result.Screenshots {
+			if objectName == "" {
+				continue
+			}
+			presignedURL, urlErr := a.ResultStore.GeneratePresignedURL(r.Context(), objectName)
+			if urlErr != nil {
+				logger.Error("Failed to generate presigned URL for screenshot", "object", objectName, "error", urlErr)
+				presignedScreenshots = append(presignedScreenshots, "") // Append empty string for frontend to handle
+				continue
+			}
+			presignedScreenshots = append(presignedScreenshots, presignedURL)
+		}
+		result.Screenshots = presignedScreenshots
+	}
+
+	// Generate for Videos
+	if len(result.Videos) > 0 {
+		presignedVideos := make([]string, 0, len(result.Videos))
+		for _, objectName := range result.Videos {
+			if objectName == "" {
+				continue
+			}
+			presignedURL, urlErr := a.ResultStore.GeneratePresignedURL(r.Context(), objectName)
+			if urlErr != nil {
+				logger.Error("Failed to generate presigned URL for video", "object", objectName, "error", urlErr)
+				presignedVideos = append(presignedVideos, "")
+				continue
+			}
+			presignedVideos = append(presignedVideos, presignedURL)
+		}
+		result.Videos = presignedVideos
+	}
+
+	// Generate for Logs if it's an object name (not inline logs).
+	// A simple heuristic: if it doesn't start with http, assume it's an object name.
+	if result.Logs != "" && !strings.HasPrefix(result.Logs, "http") {
+		presignedURL, urlErr := a.ResultStore.GeneratePresignedURL(r.Context(), result.Logs)
+		if urlErr != nil {
+			logger.Error("Failed to generate presigned URL for log file", "object", result.Logs, "error", urlErr)
+			// Do not overwrite on error, leave the object name as a fallback for debugging.
+		} else {
+			result.Logs = presignedURL
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -721,23 +773,25 @@ func (a *API) HandleUpdateJobProgress(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "Job progress updated successfully", "job_id": jobID})
 }
 
-// Helper remains the same
+// parseAndStoreFile uploads a file from a multipart request to the artifact store and returns its object name.
 func parseAndStoreFile(ctx context.Context, store storage.ResultStore, fh *multipart.FileHeader, jobID string, logger *slog.Logger) (string, error) {
 	file, err := fh.Open()
 	if err != nil {
 		return "", fmt.Errorf("failed to open uploaded file '%s': %w", fh.Filename, err)
 	}
 	defer file.Close()
-	objectName := fmt.Sprintf("%s/artifacts/%s", jobID, fh.Filename)
+	// Sanitize the filename to prevent path traversal attacks and remove directory info.
+	cleanFilename := filepath.Base(fh.Filename)
+	objectName := fmt.Sprintf("%s/artifacts/%s", jobID, cleanFilename)
 	contentType := fh.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	artifactURL, err := store.StoreArtifact(ctx, objectName, file, fh.Size, contentType)
+	err = store.StoreArtifact(ctx, objectName, file, fh.Size, contentType)
 	if err != nil {
-		return "", fmt.Errorf("failed to store artifact '%s': %w", objectName, err)
+		return "", fmt.Errorf("failed to store artifact '%s': %w", cleanFilename, err)
 	}
-	return artifactURL, nil
+	return objectName, nil
 }
 
 // isTerminalStatus checks if a job status is one that means the job processing is complete or definitively stopped.

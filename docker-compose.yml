@@ -29,6 +29,7 @@ services:
     environment:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_SERVER_URL=http://localhost:${MINIO_API_PORT}
     ports:
       - "${MINIO_API_PORT}:9000" # API Port
       - "${MINIO_CONSOLE_PORT}:9001" # Console Port
@@ -63,6 +64,7 @@ services:
       - POSTGRES_DSN=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
       - MINIO_ENDPOINT=minio:${MINIO_API_PORT}
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:${MINIO_API_PORT} # Public URL for presigned URL generation
       - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
       - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME}

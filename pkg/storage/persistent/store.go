@@ -8,8 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
-	"path"
+	"net"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/husmancristian/TA_GEAMAN/pkg/models" // Adjust import path	"time"
@@ -244,7 +245,7 @@ func (s *Store) GetProjects(ctx context.Context) ([]string, error) {
 }
 
 // NewStore creates a new persistent store instance.
-func NewStore(pgDSN, minioEndpoint, minioAccessKey, minioSecretKey, bucketName string, useSSL bool, logger *slog.Logger) (*Store, error) {
+func NewStore(pgDSN, minioEndpoint, minioPublicEndpointStr, minioAccessKey, minioSecretKey, bucketName string, useSSL bool, logger *slog.Logger) (*Store, error) {
 	// --- Connect to PostgreSQL ---
 	dbpool, err := pgxpool.New(context.Background(), pgDSN)
 	if err != nil {
@@ -257,12 +258,56 @@ func NewStore(pgDSN, minioEndpoint, minioAccessKey, minioSecretKey, bucketName s
 	logger.Info("PostgreSQL connection pool established")
 
 	// --- Connect to MinIO ---
-	minioClient, err := minio.New(minioEndpoint, &minio.Options{Creds: credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""), Secure: useSSL})
-	if err != nil {
-		dbpool.Close()
-		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+	// Determine which endpoint to use for the client. We want to SIGN with the public
+	// endpoint but CONNECT to the internal one.
+	endpointForClientConfig := minioEndpoint
+	if minioPublicEndpointStr != "" {
+		endpointForClientConfig = minioPublicEndpointStr
 	}
-	logger.Info("MinIO client initialized", slog.String("endpoint", minioEndpoint))
+
+	// The minio.New() function requires an endpoint without a scheme (e.g., "localhost:9000").
+	// We must strip "http://" or "https://" if it exists.
+	endpointForMinioClient := endpointForClientConfig
+	if i := strings.Index(endpointForMinioClient, "://"); i != -1 {
+		endpointForMinioClient = endpointForMinioClient[i+3:]
+	}
+
+	// Create a custom transport that routes requests for the public host
+	// to the internal Docker network host.
+	customTransport := http.DefaultTransport.(*http.Transport).Clone()
+	customTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// `addr` will be the host:port that the client tries to dial, which is `endpointForMinioClient`.
+		publicHost := endpointForMinioClient // Already stripped of scheme.
+
+		// If the address to dial is the public-facing one, we intercept and
+		// replace it with the internal Docker network address.
+		if addr == publicHost {
+			addr = minioEndpoint
+			logger.Debug("Redirecting MinIO connection", "from", publicHost, "to", addr)
+		}
+
+		dialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+
+	// Initialize MinIO client with the public-facing endpoint for signing,
+	// but using our custom transport for connecting.
+	minioClient, err := minio.New(endpointForMinioClient, &minio.Options{
+		Creds:     credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
+		Secure:    useSSL,
+		Transport: customTransport,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+	} else {
+		logger.Info("MinIO client initialized",
+			slog.String("signing_endpoint", endpointForMinioClient),
+			slog.String("connect_endpoint", minioEndpoint),
+		)
+	}
 
 	// --- Ensure MinIO Bucket Exists ---
 	// Use a separate context for bucket operations for clarity, though the parent context could be used.
@@ -309,7 +354,12 @@ func NewStore(pgDSN, minioEndpoint, minioAccessKey, minioSecretKey, bucketName s
 		logger.Info("Successfully set public read policy on MinIO bucket", slog.String("bucket", bucketName))
 	}
 
-	return &Store{db: dbpool, minioClient: minioClient, bucketName: bucketName, logger: logger}, nil
+	return &Store{
+		db:          dbpool,
+		minioClient: minioClient,
+		bucketName:  bucketName,
+		logger:      logger,
+	}, nil
 }
 
 // Close closes the database connection pool.
@@ -603,20 +653,16 @@ func (s *Store) GetResultsByProject(ctx context.Context, project string) ([]mode
 }
 
 // StoreArtifact uploads data to the configured MinIO bucket.
-func (s *Store) StoreArtifact(ctx context.Context, objectName string, reader io.Reader, size int64, contentType string) (string, error) {
+func (s *Store) StoreArtifact(ctx context.Context, objectName string, reader io.Reader, size int64, contentType string) error {
 	if s.bucketName == "" {
-		return "", fmt.Errorf("minio bucket name is not configured")
+		return fmt.Errorf("minio bucket name is not configured")
 	}
 	uploadInfo, err := s.minioClient.PutObject(ctx, s.bucketName, objectName, reader, size, minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
-		return "", fmt.Errorf("failed to upload artifact '%s': %w", objectName, err)
+		return fmt.Errorf("failed to upload artifact '%s': %w", objectName, err)
 	}
 	s.logger.Info("Stored artifact", slog.String("bucket", uploadInfo.Bucket), slog.String("key", uploadInfo.Key), slog.Int64("size", uploadInfo.Size))
-	artifactURL := url.URL{Scheme: "http", Host: s.minioClient.EndpointURL().Host, Path: path.Join(s.bucketName, objectName)}
-	if opts := s.minioClient.EndpointURL(); opts.Scheme == "https" {
-		artifactURL.Scheme = "https"
-	}
-	return artifactURL.String(), nil
+	return nil
 }
 
 // UpdateJobStatus updates the status and optionally the started_at time for a job.
@@ -741,4 +787,19 @@ func (s *Store) GetProjectQueueOverview(ctx context.Context, project string) (*m
 	}
 
 	return overview, nil
+}
+
+func (s *Store) GeneratePresignedURL(ctx context.Context, objectName string) (string, error) {
+	// Set the expiry time for the presigned URL. Let's use 15 minutes as an example.
+	expiry := 15 * time.Minute
+
+	// Generate the presigned URL. Because the client is now configured with the
+	// public endpoint (and a custom transport), the generated URL will be
+	// correct from the start. No rewriting is needed.
+	presignedURL, err := s.minioClient.PresignedGetObject(ctx, s.bucketName, objectName, expiry, nil)
+	if err != nil {
+		s.logger.Error("Failed to generate presigned URL for object", "object", objectName, "error", err)
+		return "", err
+	}
+	return presignedURL.String(), nil
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv" // Import strings package
 	"time"
@@ -8,19 +9,20 @@ import (
 
 // Config holds application configuration values.
 type Config struct {
-	Port                string
-	RabbitMQ_URL        string
-	Postgres_DSN        string
-	MinIO_Endpoint      string
-	MinIO_AccessKey     string
-	MinIO_SecretKey     string
-	MinIO_UseSSL        bool
-	MinIO_BucketName    string
-	LogLevel            string // e.g., "debug", "info", "warn", "error"
-	RequestTimeout      time.Duration
-	DeleteProtectionKey string // Key to protect project deletion
-	CertFile            string // Path to TLS certificate file
-	KeyFile             string // Path to TLS key file
+	Port                  string
+	RabbitMQ_URL          string
+	Postgres_DSN          string
+	MinIO_Endpoint        string
+	MinIO_Public_Endpoint string
+	MinIO_AccessKey       string
+	MinIO_SecretKey       string
+	MinIO_UseSSL          bool
+	MinIO_BucketName      string
+	LogLevel              string // e.g., "debug", "info", "warn", "error"
+	RequestTimeout        time.Duration
+	DeleteProtectionKey   string // Key to protect project deletion
+	CertFile              string // Path to TLS certificate file
+	KeyFile               string // Path to TLS key file
 
 	// Projects         []string // REMOVED: Projects will be managed via DB and cached in API
 }
@@ -30,6 +32,7 @@ func Load() (*Config, error) {
 	// Helper to get env var with default
 	getenv := func(key, fallback string) string {
 		if value, exists := os.LookupEnv(key); exists {
+			fmt.Printf("DEBUG: getenv reading %s = %q (exists: %t)\n", key, value, exists)
 			return value
 		}
 		return fallback
@@ -58,19 +61,20 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Port:                getenv("PORT", "8080"),
-		RabbitMQ_URL:        getenv("RABBITMQ_URL", "amqp://localhost:5672/"),                                    // Fallback without credentials
-		Postgres_DSN:        getenv("POSTGRES_DSN", "postgres://localhost:5432/test_results_db?sslmode=disable"), // Fallback without credentials
-		MinIO_Endpoint:      getenv("MINIO_ENDPOINT", "localhost:9000"),
-		MinIO_AccessKey:     getenv("MINIO_ACCESS_KEY", ""), // Fallback to empty, must be set in .env
-		MinIO_SecretKey:     getenv("MINIO_SECRET_KEY", ""), // Fallback to empty, must be set in .env
-		MinIO_UseSSL:        getenvBool("MINIO_USE_SSL", false),
-		MinIO_BucketName:    getenv("MINIO_BUCKET_NAME", "test-artifacts"),
-		LogLevel:            getenv("LOG_LEVEL", "info"),
-		RequestTimeout:      getenvDuration("REQUEST_TIMEOUT", 15*time.Second),
-		DeleteProtectionKey: getenv("DELETE_PROTECTION_KEY", ""), // Default to empty, should be set for protection
-		CertFile:            getenv("CERT_FILE", ""),             // Default to empty, should be set for HTTPS
-		KeyFile:             getenv("KEY_FILE", ""),              // Default to empty, should be set for HTTPS
+		Port:                  getenv("PORT", "8080"),
+		RabbitMQ_URL:          getenv("RABBITMQ_URL", "amqp://localhost:5672/"),                                    // Fallback without credentials
+		Postgres_DSN:          getenv("POSTGRES_DSN", "postgres://localhost:5432/test_results_db?sslmode=disable"), // Fallback without credentials
+		MinIO_Public_Endpoint: getenv("MINIO_PUBLIC_ENDPOINT", ""),
+		MinIO_Endpoint:        getenv("MINIO_ENDPOINT", "localhost:9000"),
+		MinIO_AccessKey:       getenv("MINIO_ACCESS_KEY", ""), // Fallback to empty, must be set in .env
+		MinIO_SecretKey:       getenv("MINIO_SECRET_KEY", ""), // Fallback to empty, must be set in .env
+		MinIO_UseSSL:          getenvBool("MINIO_USE_SSL", false),
+		MinIO_BucketName:      getenv("MINIO_BUCKET_NAME", "test-artifacts"),
+		LogLevel:              getenv("LOG_LEVEL", "info"),
+		RequestTimeout:        getenvDuration("REQUEST_TIMEOUT", 15*time.Second),
+		DeleteProtectionKey:   getenv("DELETE_PROTECTION_KEY", ""), // Default to empty, should be set for protection
+		CertFile:              getenv("CERT_FILE", ""),             // Default to empty, should be set for HTTPS
+		KeyFile:               getenv("KEY_FILE", ""),              // Default to empty, should be set for HTTPS
 		// Projects are no longer loaded from env. They are managed via DB.
 	}
 

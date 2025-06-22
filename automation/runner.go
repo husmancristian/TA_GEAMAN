@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/url"
 	"path"
+	"path/filepath"
 
 	"net/http"
 	"os"
@@ -165,101 +166,8 @@ func main() {
 				log.Printf("Error getting job for project %s: %v", bestProjectToPoll, err)
 				// Let the main loop sleep and re-evaluate.
 			} else if job != nil {
-				log.Printf("Received job ID: %s for project: %s. Initial Status: %s. Details for script: %+v", job.ID, job.Project, job.Status, job.Details)
-
-				jobCtx, cancelJobExecution := context.WithCancel(context.Background())
-				// defer cancelJobExecution() // Called explicitly or when job processing block ends
-
-				var scriptOutput *TestResult
-				var attachmentFiles []FileAttachment
-				var scriptErr error
-				var scriptLogs string
-				serverForcedStatus := "" // Status if server aborts/cancels the job
-
-				scriptDoneChan := make(chan struct{})
-				go func() {
-					defer close(scriptDoneChan)
-					// executeScript uses the 'job' object received from getNextJob.
-					// It does not make another HTTP request to get its parameters.
-					log.Printf("[%s] Calling executeScript with initial job details.", job.ID)
-					scriptOutput, attachmentFiles, scriptLogs, scriptErr = executeScript(jobCtx, apiBaseURL, job)
-				}()
-
-				abortCheckTicker := time.NewTicker(5 * time.Second) // Check every 5 seconds
-				keepCheckingForAbort := true
-
-				for keepCheckingForAbort {
-					select {
-					case <-scriptDoneChan:
-						log.Printf("Script execution goroutine finished for job %s.", job.ID)
-						keepCheckingForAbort = false
-					case <-abortCheckTicker.C:
-						log.Printf("Checking server status for job %s (project %s)", job.ID, job.Project)
-						// This request is *specifically* to check if the server has changed the job's status (e.g., to ABORTED).
-						// The 'currentJobState' obtained here does not affect the parameters 'executeScript' was started with.
-						currentJobState, err := getCurrentJobStatus(apiBaseURL, job.ID)
-						if err != nil {
-							log.Printf("Error checking job status for %s: %v. Will retry.", job.ID, err)
-							continue
-						}
-						if currentJobState != "" {
-							log.Printf("Current server status for job %s is %s", job.ID, currentJobState)
-							if currentJobState == "ABORTED" || currentJobState == "CANCELLED" || currentJobState == "ABORT_REQUESTED" {
-								log.Printf("Job %s has been %s by the server. Attempting to backup partial results.", job.ID, currentJobState)
-								// Fetch current results for backup
-								jobResultData, err := getJobResultDetails(apiBaseURL, job.ID)
-								if err != nil {
-									// Log error but continue with abort, backup is best-effort
-									log.Printf("Error fetching job result details for backup for job %s: %v. Proceeding with abort.", job.ID, err)
-								} else if jobResultData != nil { // If jobResultData is nil (e.g. 404 from getJobResultDetails), nothing to backup
-									currentTime := time.Now()
-									jobResultData.Messages = append(jobResultData.Messages, fmt.Sprintf("ABORTED AT %s", currentTime.Format(time.RFC3339Nano)))
-									jobResultData.Status = "ABORTED" // Override status
-									// TODO: Collect file attachments if executeScript provides them upon cancellation.
-									// For now, passing nil for attachments.
-									if err := postJobResultBackup(apiBaseURL, job.ID, jobResultData, nil); err != nil {
-										log.Printf("Error posting job result backup for job %s: %v", job.ID, err)
-									} else {
-										log.Printf("Successfully posted job result backup for job %s with status %s", job.ID, currentJobState)
-									}
-								} else {
-									log.Printf("No job result details found to backup for job %s.", job.ID)
-								}
-								log.Printf("Cancelling script execution for job %s due to server status: %s.", job.ID, currentJobState)
-								cancelJobExecution()
-								currentJobState = "ABORTED"
-								keepCheckingForAbort = false
-							} else if isTerminalStatus(currentJobState) && currentJobState != job.Status && serverForcedStatus == "" {
-								// If server reports a *different* terminal status and we haven't already decided to abort
-								log.Printf("Job %s is in a terminal state %s on server, different from initial. Cancelling local execution.", job.ID, currentJobState)
-								cancelJobExecution()
-								currentJobState = "ABORTED"
-								keepCheckingForAbort = false
-							}
-						}
-					case <-jobCtx.Done(): // If jobCtx is cancelled (e.g. by abort check or script itself)
-						log.Printf("Job context cancelled for job %s. Abort check loop terminating.", job.ID)
-						keepCheckingForAbort = false
-					}
-				}
-				abortCheckTicker.Stop()
-				<-scriptDoneChan // Ensure script goroutine has fully exited
-
-				finalStatusToReport := scriptOutput.Status
-				if scriptErr != nil {
-					finalStatusToReport = "FAILED"
-					if errors.Is(scriptErr, context.Canceled) { // If script error was due to cancellation
-						finalStatusToReport = "ABORTED"
-					}
-				} else if finalStatusToReport == "" { // Script finished cleanly but didn't set a status
-					finalStatusToReport = "COMPLETED" // Default to COMPLETED if no error and no other status
-				}
-				log.Printf("Reporting results for job %s: Final Status: %s, Script logs: '%s'", job.ID, finalStatusToReport, scriptLogs)
-				scriptOutput.Status = finalStatusToReport
-				if err := postJobResultBackup(apiBaseURL, job.ID, scriptOutput, attachmentFiles); err != nil {
-					log.Printf("Error reporting results for job %s: %v", job.ID, err)
-				}
-				cancelJobExecution() // Final cleanup of the context
+				// Refactored job processing logic into its own function for clarity.
+				processJob(apiBaseURL, job)
 			} else {
 				log.Printf("No job available for selected project: %s", bestProjectToPoll)
 			}
@@ -270,6 +178,84 @@ func main() {
 		// Wait for a bit before polling again
 		time.Sleep(time.Duration(pollingIntervalSeconds) * time.Second) // Configurable polling interval
 	}
+}
+
+// processJob handles the entire lifecycle of executing a single test job.
+func processJob(apiBaseURL string, job *TestJob) {
+	log.Printf("Received job ID: %s for project: %s. Initial Status: %s. Details for script: %+v", job.ID, job.Project, job.Status, job.Details)
+
+	jobCtx, cancelJobExecution := context.WithCancel(context.Background())
+	defer cancelJobExecution() // Ensure context is always cancelled when this function returns.
+
+	var scriptOutput *TestResult
+	var attachmentFiles []FileAttachment
+	var scriptErr error
+	var scriptLogs string
+	serverForcedStatus := "" // Status if server aborts/cancels the job
+
+	scriptDoneChan := make(chan struct{})
+	go func() {
+		defer close(scriptDoneChan)
+		log.Printf("[%s] Calling executeScript with initial job details.", job.ID)
+		scriptOutput, attachmentFiles, scriptLogs, scriptErr = executeScript(jobCtx, apiBaseURL, job)
+	}()
+
+	abortCheckTicker := time.NewTicker(5 * time.Second)
+	defer abortCheckTicker.Stop()
+
+	keepCheckingForAbort := true
+	for keepCheckingForAbort {
+		select {
+		case <-scriptDoneChan:
+			log.Printf("Script execution goroutine finished for job %s.", job.ID)
+			keepCheckingForAbort = false
+		case <-abortCheckTicker.C:
+			log.Printf("Checking server status for job %s (project %s)", job.ID, job.Project)
+			currentJobState, err := getCurrentJobStatus(apiBaseURL, job.ID)
+			if err != nil {
+				log.Printf("Error checking job status for %s: %v. Will retry.", job.ID, err)
+				continue
+			}
+			if currentJobState != "" {
+				log.Printf("Current server status for job %s is %s", job.ID, currentJobState)
+				if currentJobState == "ABORTED" || currentJobState == "CANCELLED" || currentJobState == "ABORT_REQUESTED" {
+					log.Printf("Job %s has been %s by the server. Attempting to backup partial results.", job.ID, currentJobState)
+					jobResultData, err := getJobResultDetails(apiBaseURL, job.ID)
+					if err != nil {
+						log.Printf("Error fetching job result details for backup for job %s: %v. Proceeding with abort.", job.ID, err)
+					} else if jobResultData != nil {
+						currentTime := time.Now()
+						jobResultData.Messages = append(jobResultData.Messages, fmt.Sprintf("ABORTED AT %s", currentTime.Format(time.RFC3339Nano)))
+						jobResultData.Status = "ABORTED"
+						if err := postJobResultBackup(apiBaseURL, job.ID, jobResultData, nil); err != nil {
+							log.Printf("Error posting job result backup for job %s: %v", job.ID, err)
+						} else {
+							log.Printf("Successfully posted job result backup for job %s with status %s", job.ID, currentJobState)
+						}
+					} else {
+						log.Printf("No job result details found to backup for job %s.", job.ID)
+					}
+					log.Printf("Cancelling script execution for job %s due to server status: %s.", job.ID, currentJobState)
+					cancelJobExecution()
+					serverForcedStatus = "ABORTED"
+					keepCheckingForAbort = false
+				} else if isTerminalStatus(currentJobState) && currentJobState != job.Status && serverForcedStatus == "" {
+					log.Printf("Job %s is in a terminal state %s on server, different from initial. Cancelling local execution.", job.ID, currentJobState)
+					cancelJobExecution()
+					serverForcedStatus = "ABORTED"
+					keepCheckingForAbort = false
+				}
+			}
+		case <-jobCtx.Done():
+			log.Printf("Job context cancelled for job %s. Abort check loop terminating.", job.ID)
+			keepCheckingForAbort = false
+		}
+	}
+
+	<-scriptDoneChan // Ensure script goroutine has fully exited
+
+	// Determine final status and report results
+	reportFinalResults(apiBaseURL, job.ID, scriptOutput, attachmentFiles, scriptLogs, scriptErr)
 }
 
 func getNextJob(apiBaseURL, project, runnerID string) (*TestJob, error) {
@@ -513,14 +499,24 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 		}
 
 		if commandErr != nil {
-			//get partial result
-			testResult, _ := getJobResultDetails(apiBaseURL, job.ID)
+			// Get partial result from server to augment with failure details.
+			testResult, fetchErr := getJobResultDetails(apiBaseURL, job.ID)
+			if fetchErr != nil {
+				log.Printf("[%s] Failed to fetch partial results after script error: %v. Creating a new result for failure reporting.", job.ID, fetchErr)
+				// If we can't even fetch the result, create a new one to report the failure.
+				testResult = &TestResult{JobID: job.ID, Project: job.Project}
+			} else if testResult == nil {
+				// This can happen if getJobResultDetails returns nil, nil on a 404.
+				log.Printf("[%s] No existing result found after script error. Creating a new result for failure reporting.", job.ID)
+				testResult = &TestResult{JobID: job.ID, Project: job.Project}
+			}
+
 			testResult.Messages = append(testResult.Messages, fmt.Sprintf("Script execution error: %v", commandErr))
 
 			if errors.Is(ctx.Err(), context.Canceled) { // Check if cancellation was the cause
 				testResult.Status = "ABORTED"
 			} else if result.Status == "" || result.Status == "RUNNING" || !isTerminalStatus(result.Status) {
-				// If script didn't set a terminal status, or it's still "RUNNING" (or other non-terminal), mark as FAILED
+				// If script didn't set a terminal status, mark as FAILED.
 				testResult.Status = "FAILED"
 			}
 			return testResult, attachments, string(commandOutput), commandErr
@@ -629,7 +625,7 @@ func postJobResultBackup(apiBaseURL, jobID string, resultData *TestResult, attac
 		}
 		defer file.Close() // Ensure file is closed
 
-		part, err := writer.CreateFormFile(fa.FieldName, fa.FilePath) // Using full path for filename in part for simplicity, consider filepath.Base(fa.FilePath)
+		part, err := writer.CreateFormFile(fa.FieldName, filepath.Base(fa.FilePath)) // Use only the base filename to prevent path issues
 		if err != nil {
 			return fmt.Errorf("failed to create form file for %s (%s): %w", fa.FieldName, fa.FilePath, err)
 		}
@@ -663,4 +659,26 @@ func postJobResultBackup(apiBaseURL, jobID string, resultData *TestResult, attac
 
 	log.Printf("Successfully posted job result backup for job %s. Server response status: %s", jobID, resp.Status)
 	return nil
+}
+
+// reportFinalResults determines the final status of a job and submits it to the server.
+func reportFinalResults(apiBaseURL, jobID string, scriptOutput *TestResult, attachments []FileAttachment, scriptLogs string, scriptErr error) {
+	finalStatusToReport := ""
+	if scriptOutput != nil {
+		finalStatusToReport = scriptOutput.Status
+	}
+
+	if scriptErr != nil {
+		finalStatusToReport = "FAILED"
+		if errors.Is(scriptErr, context.Canceled) {
+			finalStatusToReport = "ABORTED"
+		}
+	} else if finalStatusToReport == "" || !isTerminalStatus(finalStatusToReport) {
+		finalStatusToReport = "COMPLETED" // Default if no error and no other terminal status
+	}
+	log.Printf("Reporting results for job %s: Final Status: %s, Script logs: '%s'", jobID, finalStatusToReport, scriptLogs)
+	scriptOutput.Status = finalStatusToReport
+	if err := postJobResultBackup(apiBaseURL, jobID, scriptOutput, attachments); err != nil {
+		log.Printf("Error reporting results for job %s: %v", jobID, err)
+	}
 }

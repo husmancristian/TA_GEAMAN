@@ -19,7 +19,7 @@ type ResultStore interface {
 	GetResult(ctx context.Context, jobID string) (*models.TestResult, error)
 
 	// StoreArtifact handles the storage of a binary artifact (e.g., to MinIO/S3).
-	StoreArtifact(ctx context.Context, objectName string, reader io.Reader, size int64, contentType string) (string, error)
+	StoreArtifact(ctx context.Context, objectName string, reader io.Reader, size int64, contentType string) error
 
 	// GetJobs retrieves a list of ACTIVE jobs (Pending, Running, etc.).
 	GetJobs(ctx context.Context) ([]models.TestJob, error)
@@ -43,6 +43,9 @@ type ResultStore interface {
 	AddProject(ctx context.Context, projectName string) error
 	DeleteProject(ctx context.Context, projectName string) error
 	GetProjects(ctx context.Context) ([]string, error) // Gets all currently active/configured projects
+
+	// GeneratePresignedURL generates a temporary, public URL for a private object.
+	GeneratePresignedURL(ctx context.Context, objectName string) (string, error)
 
 	// Close releases any resources held by the store (e.g., DB connections).
 	Close() error

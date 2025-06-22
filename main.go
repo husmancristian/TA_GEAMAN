@@ -79,6 +79,7 @@ func main() {
 	resultStore, err := persistent.NewStore(
 		cfg.Postgres_DSN,
 		cfg.MinIO_Endpoint,
+		cfg.MinIO_Public_Endpoint,
 		cfg.MinIO_AccessKey,
 		cfg.MinIO_SecretKey,
 		cfg.MinIO_BucketName,
