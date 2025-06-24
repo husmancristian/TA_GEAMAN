@@ -9,3 +9,21 @@ docker-compose.yml
 # Local development
 .env
 *.exe # Ignore local windows executables
+
+# .dockerignore
+runner
+
+# Ignore local dependencies and git history
+node_modules
+.git
+
+# Ignore test results, reports, and logs from local runs
+test-results/
+playwright-report/
+playwright-output.log
+screenshots/
+
+
+
+# Ignore local environment files
+.env

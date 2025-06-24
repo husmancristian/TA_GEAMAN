@@ -1,0 +1,55 @@
+# Stage 1: Build the Go application (This stage remains unchanged)
+FROM golang:1.24-bullseye AS builder
+
+WORKDIR /app
+
+# Copy go.mod and go.sum to leverage Docker cache for dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the application source code
+COPY . .
+
+# Build the runner binary from its location
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /runner ./automation/runner.go
+
+# Stage 2: Create the final image with all runtime dependencies
+# Use the official Playwright image as our base. It includes Node.js, npm,
+# the browsers, and all necessary OS dependencies.
+FROM mcr.microsoft.com/playwright:v1.53.1-jammy
+
+# Install the dependencies your runner needs using Debian's package manager (apt-get)
+# We add git, python3, and python3-pip.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# # 1. First, create the directory structure that Playwright expects.
+# RUN mkdir -p /ms-playwright/chromium-1179/chrome-linux/
+
+# # 2. Then, create the symbolic link from the expected path to the actual file.
+# RUN ln -s /ms-playwright/chromium-1117/chrome-linux/chrome /ms-playwright/chromium-1179/chrome-linux/chrome
+
+# RUN ln -s /ms-playwright/chromium-1117/chrome-linux/headless_shell /ms-playwright/chromium-1179/chrome-linux/headless_shell
+
+
+# Set the working directory for our application
+WORKDIR /app
+
+# Copy the server's public certificate into the system's trust store.
+COPY localhost+2.pem /usr/local/share/ca-certificates/ta_geaman_ca.crt
+RUN update-ca-certificates
+
+# Copy the compiled Go runner binary from the 'builder' stage
+COPY --from=builder /runner .
+
+# Copy your entire Playwright project into the working directory.
+# This includes web_scripts/, playwright_web.py, package.json, etc.
+# Make sure you have a .dockerignore file to exclude node_modules.
+COPY . .
+
+# The CMD remains the same, it starts your Go runner.
+CMD ["./runner"]

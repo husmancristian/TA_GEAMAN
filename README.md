@@ -13,8 +13,8 @@ docker-compose up --build --scale runner=3 ||||| - everything + 3 instances of r
 docker-compose up --build server ( -d for detached ) ||||  - for central server
 docker-compose up -d postgres minio rabbitmq ||||  -without central server 
 
-docker exec -it ta_geaman-postgres-1 psql -U user -d test_results_db  - database 
-
+database
+docker exec -it ta_geaman-postgres-1 psql -U user -d test_results_db  
 
 docker build -t ta-geaman-runner -f Dockerfile.runner .
 
@@ -31,5 +31,14 @@ docker run --rm -it ^
 
  flutter run -d chrome 
 
-
  RUNNER_ID="native-runner-02" ./bin/runner    - set id 
+
+docker  build -t playwright_runner_two -f Dockerfile.containerized-runner-web .
+
+docker run --rm --ipc=host --network="host" -e RUNNER_ID="runner-002-macos-webApp" -e API_BASE_URL="https://localhost:8443/api/v1" -e ASSIGNED_PROJECTS="webApp" -e CONTAINER="true"   playwright_runner_two
+
+docker run --rm --ipc=host --network="host" -e RUNNER_ID="runner-003-macos-webApp" -e API_BASE_URL="https://localhost:8443/api/v1" -e ASSIGNED_PROJECTS="webApp" -e CONTAINER="true"   playwright_runner_two
+
+docker run --rm --ipc=host --network="host" -e RUNNER_ID="runner-004-macos-webApp" -e API_BASE_URL="https://localhost:8443/api/v1" -e ASSIGNED_PROJECTS="webApp" -e CONTAINER="true"   playwright_runner_two
+
+

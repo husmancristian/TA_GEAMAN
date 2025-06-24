@@ -9,3 +9,12 @@
 *.so
 *.dylib
 bin/
+TA_SCRIPTS
+*.png
+*.mp4
+test-results
+test-server
+runner
+result.json
+certificate.p12
+.DS_Store

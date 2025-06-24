@@ -422,7 +422,7 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 		EnqueuedAt: job.EnqueuedAt,
 		StartedAt:  job.StartedAt, // This is when the API marked it as started.
 	}
-
+	
 	if scriptCommandStr, ok := job.Details["script_command"].(string); ok {
 		parts := strings.Fields(scriptCommandStr)
 		if len(parts) == 0 {
@@ -479,8 +479,12 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			for _, screenshotPath := range result.Screenshots {
 				p := strings.TrimSpace(screenshotPath)
 				if p != "" {
-					attachments = append(attachments, FileAttachment{FieldName: "screenshots", FilePath: p})
-					log.Printf("[%s] Added screenshot attachment: %s", job.ID, p)
+					fullPath := p
+					if executionDir != "" {
+						fullPath = filepath.Join(executionDir, p)
+					}
+					attachments = append(attachments, FileAttachment{FieldName: "screenshots", FilePath: fullPath})
+					log.Printf("[%s] Added screenshot attachment: %s", job.ID, fullPath)
 				}
 			}
 		}
@@ -488,14 +492,23 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			for _, videoPath := range result.Videos {
 				p := strings.TrimSpace(videoPath)
 				if p != "" {
-					attachments = append(attachments, FileAttachment{FieldName: "videos", FilePath: p})
-					log.Printf("[%s] Added video attachment: %s", job.ID, p)
+					fullPath := p
+					if executionDir != "" {
+						fullPath = filepath.Join(executionDir, p)
+					}
+					attachments = append(attachments, FileAttachment{FieldName: "videos", FilePath: fullPath})
+					log.Printf("[%s] Added video attachment: %s", job.ID, fullPath)
 				}
 			}
 		}
 		if strings.TrimSpace(logPathFromScriptOutput) != "" {
-			attachments = append(attachments, FileAttachment{FieldName: "log_file", FilePath: strings.TrimSpace(logPathFromScriptOutput)})
-			log.Printf("[%s] Added log file attachment from script's 'logs' field: %s", job.ID, logPathFromScriptOutput)
+			logPath := strings.TrimSpace(logPathFromScriptOutput)
+			fullPath := logPath
+			if executionDir != "" {
+				fullPath = filepath.Join(executionDir, logPath)
+			}
+			attachments = append(attachments, FileAttachment{FieldName: "log_file", FilePath: fullPath})
+			log.Printf("[%s] Added log file attachment from script's 'logs' field: %s", job.ID, fullPath)
 		}
 
 		if commandErr != nil {
