@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,14 +13,15 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
-
+	
 	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
-
+	"runtime"
+	"syscall" 	
 	"github.com/joho/godotenv"
 )
 
@@ -182,80 +182,61 @@ func main() {
 
 // processJob handles the entire lifecycle of executing a single test job.
 func processJob(apiBaseURL string, job *TestJob) {
-	log.Printf("Received job ID: %s for project: %s. Initial Status: %s. Details for script: %+v", job.ID, job.Project, job.Status, job.Details)
+	log.Printf("Received job ID: %s for project: %s.", job.ID, job.Project)
 
 	jobCtx, cancelJobExecution := context.WithCancel(context.Background())
-	defer cancelJobExecution() // Ensure context is always cancelled when this function returns.
+	defer cancelJobExecution()
 
 	var scriptOutput *TestResult
 	var attachmentFiles []FileAttachment
 	var scriptErr error
 	var scriptLogs string
-	serverForcedStatus := "" // Status if server aborts/cancels the job
 
 	scriptDoneChan := make(chan struct{})
 	go func() {
 		defer close(scriptDoneChan)
-		log.Printf("[%s] Calling executeScript with initial job details.", job.ID)
+		log.Printf("[%s] Calling executeScript...", job.ID)
 		scriptOutput, attachmentFiles, scriptLogs, scriptErr = executeScript(jobCtx, apiBaseURL, job)
+		log.Printf("Script logs  %s.", scriptLogs)
+		log.Printf("Script error  %s.", scriptErr)
+
+
 	}()
 
 	abortCheckTicker := time.NewTicker(5 * time.Second)
 	defer abortCheckTicker.Stop()
 
-	keepCheckingForAbort := true
-	for keepCheckingForAbort {
+	keepChecking := true
+	for keepChecking {
 		select {
 		case <-scriptDoneChan:
-			log.Printf("Script execution goroutine finished for job %s.", job.ID)
-			keepCheckingForAbort = false
+			log.Printf("Script execution finished for job %s.", job.ID)
+			keepChecking = false // Exit the loop
 		case <-abortCheckTicker.C:
-			log.Printf("Checking server status for job %s (project %s)", job.ID, job.Project)
 			currentJobState, err := getCurrentJobStatus(apiBaseURL, job.ID)
 			if err != nil {
 				log.Printf("Error checking job status for %s: %v. Will retry.", job.ID, err)
 				continue
 			}
-			if currentJobState != "" {
-				log.Printf("Current server status for job %s is %s", job.ID, currentJobState)
-				if currentJobState == "ABORTED" || currentJobState == "CANCELLED" || currentJobState == "ABORT_REQUESTED" {
-					log.Printf("Job %s has been %s by the server. Attempting to backup partial results.", job.ID, currentJobState)
-					jobResultData, err := getJobResultDetails(apiBaseURL, job.ID)
-					if err != nil {
-						log.Printf("Error fetching job result details for backup for job %s: %v. Proceeding with abort.", job.ID, err)
-					} else if jobResultData != nil {
-						currentTime := time.Now()
-						jobResultData.Messages = append(jobResultData.Messages, fmt.Sprintf("ABORTED AT %s", currentTime.Format(time.RFC3339Nano)))
-						jobResultData.Status = "ABORTED"
-						if err := postJobResultBackup(apiBaseURL, job.ID, jobResultData, nil); err != nil {
-							log.Printf("Error posting job result backup for job %s: %v", job.ID, err)
-						} else {
-							log.Printf("Successfully posted job result backup for job %s with status %s", job.ID, currentJobState)
-						}
-					} else {
-						log.Printf("No job result details found to backup for job %s.", job.ID)
-					}
-					log.Printf("Cancelling script execution for job %s due to server status: %s.", job.ID, currentJobState)
-					cancelJobExecution()
-					serverForcedStatus = "ABORTED"
-					keepCheckingForAbort = false
-				} else if isTerminalStatus(currentJobState) && currentJobState != job.Status && serverForcedStatus == "" {
-					log.Printf("Job %s is in a terminal state %s on server, different from initial. Cancelling local execution.", job.ID, currentJobState)
-					cancelJobExecution()
-					serverForcedStatus = "ABORTED"
-					keepCheckingForAbort = false
-				}
+			
+			// If server wants to abort, just cancel the context and let the main logic handle it.
+			if currentJobState == "ABORTED" || currentJobState == "CANCELLED" || currentJobState == "ABORT_REQUESTED" {
+				log.Printf("Server status for job %s is '%s'. Cancelling local execution.", job.ID, currentJobState)
+				cancelJobExecution()
+				keepChecking = false // The cancellation will cause scriptDoneChan to close.
 			}
-		case <-jobCtx.Done():
-			log.Printf("Job context cancelled for job %s. Abort check loop terminating.", job.ID)
-			keepCheckingForAbort = false
 		}
 	}
+	// Wait for the script goroutine to fully exit, even if it finished before the abort check.
+	<-scriptDoneChan
 
-	<-scriptDoneChan // Ensure script goroutine has fully exited
-
-	// Determine final status and report results
-	reportFinalResults(apiBaseURL, job.ID, scriptOutput, attachmentFiles, scriptLogs, scriptErr)
+	// The scriptErr and scriptOutput now reliably reflect the final state (including ABORTED).
+	log.Printf("Reporting final results for job %s. Final Status determined by script: '%s'", job.ID, scriptOutput.Status)
+	if err := postJobResultBackup(apiBaseURL, job.ID, scriptOutput, attachmentFiles); err != nil {
+		log.Printf("Error reporting final results for job %s: %v", job.ID, err)
+	} else {
+		log.Printf("Successfully reported final results for job %s.", job.ID)
+	}
 }
 
 func getNextJob(apiBaseURL, project, runnerID string) (*TestJob, error) {
@@ -377,70 +358,59 @@ func getLocalPathFromURL(repoURL string) (string, error) {
 }
 
 func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output *TestResult, attachments []FileAttachment, scriptLogs string, err error) {
-	// This function uses job.Details (and other fields from 'job') as fetched by getNextJob.
 	log.Printf("[%s]  executeScript: Starting for job ID: %s. Details: %+v.", job.ID, job.ID, job.Details)
 
-	// --- Git Clone/Pull Logic ---
-	var executionDir string // This will be the directory to run the script from.
+	// --- Git Clone/Pull Logic 
+	var executionDir string
+	var logPathFromScriptOutput string
 	if scriptSourceURL, ok := job.Details["script_source"].(string); ok && scriptSourceURL != "" {
 		localRepoPath, pathErr := getLocalPathFromURL(scriptSourceURL)
 		if pathErr != nil {
 			log.Printf("[%s] Warning: Could not derive local path from script source URL '%s': %v. Will attempt to run with local sources.", job.ID, scriptSourceURL, pathErr)
 		} else {
-			// Check if the directory exists
 			if _, statErr := os.Stat(localRepoPath); os.IsNotExist(statErr) {
-				// Directory does not exist, so clone it
 				log.Printf("[%s] Cloning repository from %s into %s", job.ID, scriptSourceURL, localRepoPath)
 				gitCmd := exec.Command("git", "clone", scriptSourceURL, localRepoPath)
 				output, gitErr := gitCmd.CombinedOutput()
 				if gitErr != nil {
 					log.Printf("[%s] Warning: 'git clone' failed: %v. Output: %s. Will attempt to run with local sources.", job.ID, gitErr, string(output))
 				} else {
-					executionDir = localRepoPath // Set execution dir on successful clone
+					executionDir = localRepoPath
 				}
 			} else {
-				// Directory exists, so force pull latest changes, overwriting local modifications.
 				log.Printf("[%s] Force pulling latest changes for repository in %s", job.ID, localRepoPath)
-
-				// A sequence of commands to fetch, reset hard, and clean the directory.
 				commands := [][]string{
 					{"git", "fetch", "--all"},
-					// IMPORTANT: You may need to change 'origin/main' to your default branch (e.g., 'origin/master').
-					{"git", "reset", "--hard", "origin/main"}, 
+					{"git", "reset", "--hard", "origin/main"},
 					{"git", "clean", "-fdx"},
 				}
-
 				var pullErr error
 				for _, c := range commands {
 					cmd := exec.Command(c[0], c[1:]...)
 					cmd.Dir = localRepoPath
 					if output, err := cmd.CombinedOutput(); err != nil {
-						// Log the error but continue; a clean might fail on a clean repo, which is fine.
 						log.Printf("[%s] Git command '%s' failed: %v. Output: %s", job.ID, strings.Join(c, " "), err, string(output))
 						pullErr = err
-						break // Stop if a critical command like fetch or reset fails.
+						break
 					}
 				}
-
 				if pullErr != nil {
 					log.Printf("[%s] Force pull encountered errors. Will attempt to run with local sources.", job.ID)
 				}
-				
 				executionDir = localRepoPath
 			}
 		}
 	}
 
-	// Initialize the result object that will be populated and returned.
 	result := &TestResult{
 		JobID:      job.ID,
 		Project:    job.Project,
-		Details:    job.Details, // This is the original job.Details passed to the script.
+		Details:    job.Details,
 		Priority:   job.Priority,
 		EnqueuedAt: job.EnqueuedAt,
-		StartedAt:  job.StartedAt, // This is when the API marked it as started.
+		StartedAt:  job.StartedAt,
 	}
-	
+
 	if scriptCommandStr, ok := job.Details["script_command"].(string); ok {
 		parts := strings.Fields(scriptCommandStr)
 		if len(parts) == 0 {
@@ -457,15 +427,13 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			args = parts[1:]
 		}
 
-		// Marshal the inner 'details' map (which is job.Details["details"]) to a JSON string
 		innerDetailsJSON, errMarshal := json.Marshal(job.Details)
 		if errMarshal != nil {
 			log.Printf("[%s] Error marshalling inner details to JSON: %v", job.ID, errMarshal)
-			// Decide how to handle this error, e.g., return an error or try to proceed without this arg
 			return nil, nil, "", fmt.Errorf("failed to marshal inner details: %w", errMarshal)
 		}
 		args = append(args, string(innerDetailsJSON))
-
+		
 		cmd := exec.Command(command, args...)
 		if executionDir != "" {
 			cmd.Dir = executionDir
@@ -474,25 +442,144 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			log.Printf("[%s] Executing command '%s' with args %v in runner's working directory.", job.ID, command, args)
 		}
 
-		commandOutput, commandErr := cmd.CombinedOutput() // Captures both stdout and stderr
-		fmt.Println("Command executed.")
+		if runtime.GOOS != "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		}
+		var stdoutBuffer, stderrBuffer bytes.Buffer
+		cmd.Stdout = &stdoutBuffer
+		cmd.Stderr = &stderrBuffer
 
-		var logPathFromScriptOutput string
-		if len(commandOutput) > 0 {
-			log.Printf("Script output: %s", commandOutput)
+		if err := cmd.Start(); err != nil {
+			errMsg := fmt.Sprintf("Error starting script command: %v", err)
+			log.Printf("[%s] %s", job.ID, errMsg)
+			result.Status = "ERROR"
+			result.Logs = errMsg
+			return result, nil, "", fmt.Errorf(errMsg)
+		}
 
-			errUnmarshal := json.Unmarshal(commandOutput, result)
-			// Append command output to messages
-			if len(commandOutput) > 0 {
-				result.Messages = append(result.Messages, fmt.Sprintf("Script STDOUT/STDERR: %s", string(commandOutput)))
-			}
-			if errUnmarshal != nil {
-				log.Printf("[%s] Warning: Failed to unmarshal script output as JSON: %v. Script output will be treated as plain logs.", job.ID, errUnmarshal)
+		log.Printf("[%s] Script process started with PID %d.", job.ID, cmd.Process.Pid)
+
+		cmdDone := make(chan error, 1)
+		go func() {
+			cmdDone <- cmd.Wait()
+		}()
+		
+		var commandErr error
+
+		select {
+		case <-ctx.Done():
+			log.Printf("[%s] Context cancelled. Sending termination signal to process group %d...", job.ID, cmd.Process.Pid)
+			killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			if killErr != nil {
+				log.Printf("[%s] Failed to send SIGTERM to process group: %v. Attempting forceful kill.", job.ID, killErr)
+				cmd.Process.Kill() // Fallback to forceful kill
 			} else {
-				logPathFromScriptOutput = result.Logs // Capture path from script's "logs" field
-				log.Printf("[%s] Successfully unmarshalled script output into TestResult. Script-provided status: '%s'", job.ID, result.Status)
+				log.Printf("[%s] SIGTERM sent successfully.", job.ID)
+			}
+			commandErr = <-cmdDone 
+			log.Printf("[%s] Process terminated after cancellation with error: %v", job.ID, commandErr)
+			
+			// After aborting, we still need to process the buffers to find attachment paths.
+			stdoutOutput := stdoutBuffer.Bytes()
+			stderrOutput := stderrBuffer.String()
+			fullLogs := fmt.Sprintf("STDERR:\n%s", stderrOutput)
+
+			// Set the definitive aborted status.
+			result.Status = "ABORTED"
+			result.Messages = append(result.Messages, "Job was aborted by runner.", fullLogs)
+
+			// Attempt to parse the partial output to salvage attachment info.
+			if len(stdoutOutput) > 0 {
+				if errUnmarshal := json.Unmarshal(stdoutOutput, result); errUnmarshal == nil {
+					log.Printf("[%s] Successfully parsed partial report from aborted script to find attachments.", job.ID)
+					
+					// Log file
+					if strings.TrimSpace(result.Logs) != "" {
+						logPath := strings.TrimSpace(result.Logs)
+						fullPath := logPath
+						if executionDir != "" {
+							fullPath = filepath.Join(executionDir, logPath)
+						}
+						attachments = append(attachments, FileAttachment{FieldName: "log_file", FilePath: fullPath})
+						log.Printf("[%s] Found log file attachment in aborted report: %s", job.ID, fullPath)
+					}
+
+					// Screenshots
+					if len(result.Screenshots) > 0 {
+						for _, screenshotPath := range result.Screenshots {
+							p := strings.TrimSpace(screenshotPath)
+							if p != "" {
+								fullPath := p
+								if executionDir != "" {
+									fullPath = filepath.Join(executionDir, p)
+								}
+								attachments = append(attachments, FileAttachment{FieldName: "screenshots", FilePath: fullPath})
+								log.Printf("[%s] Found screenshot attachment in aborted report: %s", job.ID, fullPath)
+							}
+						}
+					}
+					// Videos
+					if len(result.Videos) > 0 {
+						for _, videoPath := range result.Videos {
+							p := strings.TrimSpace(videoPath)
+							if p != "" {
+								fullPath := p
+								if executionDir != "" {
+									fullPath = filepath.Join(executionDir, p)
+								}
+								attachments = append(attachments, FileAttachment{FieldName: "videos", FilePath: fullPath})
+								log.Printf("[%s] Found video attachment in aborted report: %s", job.ID, fullPath)
+							}
+						}
+					}
+
+				} else {
+					log.Printf("[%s] Could not parse partial JSON from aborted script: %v", job.ID, errUnmarshal)
+				}
+			}
+		
+			// Return the aborted result with any attachments we found.
+			return result, attachments, fullLogs, context.Canceled
+
+
+		case err := <-cmdDone:
+			log.Printf("[%s] Script process finished naturally.", job.ID)
+			commandErr = err
+		}
+		
+		stdoutOutput := stdoutBuffer.Bytes()
+		stderrOutput := stderrBuffer.String()
+		fullLogs := ""
+
+		if len(stdoutOutput) > 0 {
+			log.Printf("[%s] Script STDOUT:\n%s", job.ID, string(stdoutOutput))
+			fullLogs += fmt.Sprintf("STDOUT:\n%s\n", string(stdoutOutput))
+		}
+		if len(stderrOutput) > 0 {
+			log.Printf("[%s] Script STDERR:\n%s", job.ID, stderrOutput)
+			fullLogs += fmt.Sprintf("STDERR:\n%s\n", stderrOutput)
+		}
+		
+		if len(stdoutOutput) > 0 {
+			// Attempt to unmarshal the script's output into the result struct.
+			// We overwrite the existing 'result' object with the more detailed one from the script.
+			errUnmarshal := json.Unmarshal(stdoutOutput, result)
+			if errUnmarshal != nil {
+				log.Printf("[%s] Warning: Failed to unmarshal script STDOUT as JSON: %v. Output will be treated as plain logs.", job.ID, errUnmarshal)
+				// If parsing fails but the script exited with code 0, it's ambiguous. We can call it FAILED.
+				if commandErr == nil {
+					result.Status = "ERROR"
+					result.Messages = append(result.Messages, "Script finished successfully but STDOUT was not valid JSON.")
+				}
+			} else {
+				logPathFromScriptOutput = result.Logs
+				log.Printf("[%s] Successfully unmarshalled script output. Script-provided status: '%s'", job.ID, result.Status)
 			}
 		}
+		
+		// Always append the raw logs for debugging purposes
+		result.Messages = append(result.Messages, fullLogs)
+		
 		if len(result.Screenshots) > 0 {
 			for _, screenshotPath := range result.Screenshots {
 				p := strings.TrimSpace(screenshotPath)
@@ -528,38 +615,26 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 			attachments = append(attachments, FileAttachment{FieldName: "log_file", FilePath: fullPath})
 			log.Printf("[%s] Added log file attachment from script's 'logs' field: %s", job.ID, fullPath)
 		}
-
+		
 		if commandErr != nil {
-			// Get partial result from server to augment with failure details.
-			testResult, fetchErr := getJobResultDetails(apiBaseURL, job.ID)
-			if fetchErr != nil {
-				log.Printf("[%s] Failed to fetch partial results after script error: %v. Creating a new result for failure reporting.", job.ID, fetchErr)
-				// If we can't even fetch the result, create a new one to report the failure.
-				testResult = &TestResult{JobID: job.ID, Project: job.Project}
-			} else if testResult == nil {
-				// This can happen if getJobResultDetails returns nil, nil on a 404.
-				log.Printf("[%s] No existing result found after script error. Creating a new result for failure reporting.", job.ID)
-				testResult = &TestResult{JobID: job.ID, Project: job.Project}
+			if result.Status == "" || !isTerminalStatus(result.Status) {
+				result.Status = "FAILED"
 			}
-
-			testResult.Messages = append(testResult.Messages, fmt.Sprintf("Script execution error: %v", commandErr))
-
-			if errors.Is(ctx.Err(), context.Canceled) { // Check if cancellation was the cause
-				testResult.Status = "ABORTED"
-			} else if result.Status == "" || result.Status == "RUNNING" || !isTerminalStatus(result.Status) {
-				// If script didn't set a terminal status, mark as FAILED.
-				testResult.Status = "FAILED"
-			}
-			return testResult, attachments, string(commandOutput), commandErr
+			result.Messages = append(result.Messages, fmt.Sprintf("Script execution failed with error: %v", commandErr))
+			return result, attachments, fullLogs, commandErr
 		}
 
-		return result, attachments, string(commandOutput), commandErr
+		// If we get here with no error and no status, mark as completed.
+		if result.Status == "" {
+			result.Status = "COMPLETED"
+		}
+		return result, attachments, fullLogs, nil
 
 	} else {
-		errMsg := "Error: 'script_command' not found or is not a string."
+		errMsg := "Error: 'script_command' not found, is empty, or is not a string."
 		log.Printf("[%s] %s", job.ID, errMsg)
 		result.Status = "ERROR"
-		result.Logs = errMsg
+		result.Messages = append(result.Messages, errMsg)
 		return result, nil, "", fmt.Errorf(errMsg)
 	}
 }
@@ -692,24 +767,3 @@ func postJobResultBackup(apiBaseURL, jobID string, resultData *TestResult, attac
 	return nil
 }
 
-// reportFinalResults determines the final status of a job and submits it to the server.
-func reportFinalResults(apiBaseURL, jobID string, scriptOutput *TestResult, attachments []FileAttachment, scriptLogs string, scriptErr error) {
-	finalStatusToReport := ""
-	if scriptOutput != nil {
-		finalStatusToReport = scriptOutput.Status
-	}
-
-	if scriptErr != nil {
-		finalStatusToReport = "FAILED"
-		if errors.Is(scriptErr, context.Canceled) {
-			finalStatusToReport = "ABORTED"
-		}
-	} else if finalStatusToReport == "" || !isTerminalStatus(finalStatusToReport) {
-		finalStatusToReport = "COMPLETED" // Default if no error and no other terminal status
-	}
-	log.Printf("Reporting results for job %s: Final Status: %s, Script logs: '%s'", jobID, finalStatusToReport, scriptLogs)
-	scriptOutput.Status = finalStatusToReport
-	if err := postJobResultBackup(apiBaseURL, jobID, scriptOutput, attachments); err != nil {
-		log.Printf("Error reporting results for job %s: %v", jobID, err)
-	}
-}
