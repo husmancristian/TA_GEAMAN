@@ -7,7 +7,7 @@ Generic test automation framework - Support for starting, queueing and stopping 
 go build -o runner.exe ./automation/runner.go
 go build -o test-server.exe ./main.go
 ----macos
-go build -o ./bin/runner ./automation/runner.go
+go build -o runner ./automation/runner.go
 
 docker-compose up --build --scale runner=3 ||||| - everything + 3 instances of runnes 
 docker-compose up --build server ( -d for detached ) ||||  - for central server

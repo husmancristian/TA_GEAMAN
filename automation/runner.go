@@ -399,15 +399,33 @@ func executeScript(ctx context.Context, apiBaseURL string, job *TestJob) (output
 					executionDir = localRepoPath // Set execution dir on successful clone
 				}
 			} else {
-				// Directory exists, so pull latest changes
-				log.Printf("[%s] Pulling latest changes for repository in %s", job.ID, localRepoPath)
-				gitCmd := exec.Command("git", "pull")
-				gitCmd.Dir = localRepoPath // Run 'git pull' inside the repo directory
-				output, gitErr := gitCmd.CombinedOutput()
-				if gitErr != nil {
-					log.Printf("[%s] Warning: 'git pull' failed: %v. Output: %s. Will attempt to run with local sources.", job.ID, gitErr, string(output))
+				// Directory exists, so force pull latest changes, overwriting local modifications.
+				log.Printf("[%s] Force pulling latest changes for repository in %s", job.ID, localRepoPath)
+
+				// A sequence of commands to fetch, reset hard, and clean the directory.
+				commands := [][]string{
+					{"git", "fetch", "--all"},
+					// IMPORTANT: You may need to change 'origin/main' to your default branch (e.g., 'origin/master').
+					{"git", "reset", "--hard", "origin/main"}, 
+					{"git", "clean", "-fdx"},
 				}
-				// Even if pull fails, we can still try to run from this directory.
+
+				var pullErr error
+				for _, c := range commands {
+					cmd := exec.Command(c[0], c[1:]...)
+					cmd.Dir = localRepoPath
+					if output, err := cmd.CombinedOutput(); err != nil {
+						// Log the error but continue; a clean might fail on a clean repo, which is fine.
+						log.Printf("[%s] Git command '%s' failed: %v. Output: %s", job.ID, strings.Join(c, " "), err, string(output))
+						pullErr = err
+						break // Stop if a critical command like fetch or reset fails.
+					}
+				}
+
+				if pullErr != nil {
+					log.Printf("[%s] Force pull encountered errors. Will attempt to run with local sources.", job.ID)
+				}
+				
 				executionDir = localRepoPath
 			}
 		}
